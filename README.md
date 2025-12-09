@@ -206,6 +206,7 @@ Tune `CHUNKS`, `NUM_PARALLEL`, or the Habitat config inside `eval.sh` to rebalan
 
 ## 📚 Resources & References
 - Baseline checkpoint: [omlab/opentrackvla-qwen06b](https://huggingface.co/omlab/opentrackvla-qwen06b)
+- LLM backbone: [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B)
 - Vision towers: [facebook/dinov3-vits16-pretrain-lvd1689m](https://huggingface.co/facebook/dinov3-vits16-pretrain-lvd1689m), [google/siglip-so400m-patch14-384](https://huggingface.co/google/siglip-so400m-patch14-384)
 - TrackVLA: Embodied Visual Tracking in the Wild [arXiv:2505.23189](https://arxiv.org/abs/2505.23189)
 - Embodied Navigation Foundation Model [arXiv:2509.12129](https://arxiv.org/abs/2509.12129)
