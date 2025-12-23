@@ -222,7 +222,7 @@ If you find OpenTrackVLA useful in your research or applications, please cite it
   year         = {2025},
   publisher    = {GitHub},
   journal      = {GitHub Repository},
-  howpublished = {\url{[https://github.com/yourusername/OpenTrackVLA](https://github.com/yourusername/OpenTrackVLA)}}
+  howpublished = {\url{[https://github.com/om-ai-lab/OpenTrackVLA](https://github.com/om-ai-lab/OpenTrackVLA)}}
 }
 ```
 
