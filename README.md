@@ -224,5 +224,6 @@ If you find OpenTrackVLA useful in your research or applications, please cite it
   journal      = {GitHub Repository},
   howpublished = {\url{[https://github.com/yourusername/OpenTrackVLA](https://github.com/yourusername/OpenTrackVLA)}}
 }
+```
 
 **Happy tracking!** Contributions and issue reports are welcome via pull requests.
