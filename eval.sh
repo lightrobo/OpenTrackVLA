@@ -1,12 +1,13 @@
-CHUNKS=30
+CHUNKS=15
 NUM_PARALLEL=1
 SAVE_PATH="sim_data/eval/stt"
-DINO_MODEL=facebook/dinov3-vits16-pretrain-lvd1689m
 
-if [ -n "${HF_MODEL_DIR:-}" ]; then
-    export HF_MODEL_DIR
-    echo "[eval] Using HuggingFace planner weights from ${HF_MODEL_DIR}"
-fi
+# Set model paths
+export HF_MODEL_DIR="/mnt/data/models/opentrackvla-qwen06b"
+export DINOV3_MODEL_PATH="/mnt/data/models/vision_tower/dinov3-vits16"
+
+echo "[eval] Using planner: ${HF_MODEL_DIR}"
+echo "[eval] Using DINOv3: ${DINOV3_MODEL_PATH}"
 
 IDX=0
 while [ $IDX -lt $CHUNKS ]; do

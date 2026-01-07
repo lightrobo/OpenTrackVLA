@@ -20,7 +20,11 @@ from collections import deque
 try:
     from model import OpenTrackVLA as PlannerModel, ModelConfig as PlannerConfig
     from cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens
-except Exception:
+    print(f"[import] model/cache_gridpool OK: PlannerModel={PlannerModel}")
+except Exception as e:
+    import traceback
+    print(f"[import] FAILED model/cache_gridpool: {e}")
+    traceback.print_exc()
     PlannerModel = None  # type: ignore
     PlannerConfig = None  # type: ignore
     VisionFeatureCacher = None  # type: ignore
@@ -29,7 +33,9 @@ except Exception:
 
 try:
     from open_trackvla_hf import OpenTrackVLAForWaypoint
-except Exception:
+    print(f"[import] open_trackvla_hf OK: {OpenTrackVLAForWaypoint}")
+except Exception as e:
+    print(f"[import] FAILED open_trackvla_hf: {e}")
     OpenTrackVLAForWaypoint = None  # type: ignore
 
 try:
@@ -254,9 +260,13 @@ class GTBBoxAgent(AgentConfig):
         
         # Prefer planner action (train_planner) if available, then TrackVLA, else PID
         planner_action = self._planner_action(rgb_, instruction)
-        action = planner_action
+        if planner_action is None:
+            print("[WARNING] Planner returned None, using default stop action [0, 0, 0]")
+            action = [0.0, 0.0, 0.0]
+        else:
+            action = planner_action
         
-        print (f"Planner action: {action}")
+        print(f"Planner action: {action}")
 
         self.last_action = action
         # Draw predicted trajectory overlay (if available)
@@ -373,9 +383,11 @@ class GTBBoxAgent(AgentConfig):
     def _encode_frame_tokens(self, rgb_np: np.ndarray):
         """Encode an RGB frame (H,W,3, uint8-like) into (Vcoarse(4,C), Vfine(64,C))."""
         if grid_pool_tokens is None:
+            print("[encode] SKIP: grid_pool_tokens is None")
             return None, None
         enc = self._ensure_vision_cache()
         if enc is None:
+            print("[encode] SKIP: VisionFeatureCacher is None")
             return None, None
         try:
             from PIL import Image
@@ -386,20 +398,26 @@ class GTBBoxAgent(AgentConfig):
             Vfine = grid_pool_tokens(Vt_cat, Hp, Wp, out_tokens=64)[0].float()   # (64, C)
             Vcoarse = grid_pool_tokens(Vt_cat, Hp, Wp, out_tokens=4)[0].float()  # (4, C)
             return Vcoarse, Vfine
-        except Exception:
+        except Exception as e:
+            import traceback
+            print(f"[encode] _encode_frame_tokens exception: {e}")
+            traceback.print_exc()
             return None, None
 
     def _planner_action(self, rgb_frame_np: np.ndarray, instruction: Optional[str]) -> Optional[List[float]]:
         """Use NavFoM planner to predict waypoints and convert to [vx, vy, wz]."""
         if self.planner_model is None and PlannerModel is None:
+            print("[planner] SKIP: planner_model=None and PlannerModel=None")
             return None
         # Encode current frame tokens
         Vc, Vf = self._encode_frame_tokens(rgb_frame_np)
         if Vc is None or Vf is None:
+            print(f"[planner] SKIP: _encode_frame_tokens failed (Vc={Vc is not None}, Vf={Vf is not None})")
             self._last_predicted_traj = None
             return None
         # Require planner model to be initialized once
         if self.planner_model is None:
+            print("[planner] SKIP: planner_model is None after encoding")
             self._last_predicted_traj = None
             return None
         try:
@@ -446,7 +464,10 @@ class GTBBoxAgent(AgentConfig):
             print (f"Planner action: {vx}, {vy}, {wz}")
             return [float(vx), float(vy), float(wz)]
             
-        except Exception:
+        except Exception as e:
+            import traceback
+            print(f"[planner] _planner_action failed: {e}")
+            traceback.print_exc()
             self._last_predicted_traj = None
             return None
 

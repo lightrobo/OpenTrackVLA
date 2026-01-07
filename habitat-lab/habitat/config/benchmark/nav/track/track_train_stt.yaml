@@ -146,7 +146,7 @@ habitat:
       - agent_1_localization_sensor
   simulator:
     type: RearrangeSim-v2
-    scene_dataset: "data/scene_datasets/hssd-hab/hssd-hab.scene_dataset_config.json"
+    scene_dataset: "data/scene_datasets/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
     navmesh_include_static_objects: True
     seed: 100
     ctrl_freq: 40

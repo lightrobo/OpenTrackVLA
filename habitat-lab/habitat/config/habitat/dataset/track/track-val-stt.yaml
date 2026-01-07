@@ -6,4 +6,4 @@ defaults:
 
 type: PointNav-v1
 split: val
-data_path: ./data/datasets/track/STT/{split}/{split}.json.gz
+data_path: ./data/datasets/track/STT/{split}/{split}_hm3d_only.json.gz

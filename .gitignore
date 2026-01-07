@@ -19,3 +19,4 @@ ckpt*/
 
 *.npy
 *.npz
+sim_data/eval/
