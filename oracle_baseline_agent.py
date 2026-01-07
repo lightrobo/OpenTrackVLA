@@ -192,6 +192,7 @@ class OracleBaselineAgent(AgentConfig):
         self.target_pos_history = deque(maxlen=5)
         self.prev_error_t = 0
         self.prev_error_f = 0
+        self.current_waypoint = None  # 当前 navmesh waypoint
         
         self.reset()
 
@@ -266,9 +267,6 @@ class OracleBaselineAgent(AgentConfig):
         height, width = rgb_.shape[:2]
         self.rgb_list.append(rgb_)
         
-        # 渲染2D可视化帧
-        self._render_2d_frame()
-        
         gt_distance = self._get_gt_distance()
         
         # ============================================================
@@ -326,6 +324,9 @@ class OracleBaselineAgent(AgentConfig):
         # 2.2 目标朝我们来 - 后退
         # if self._is_target_approaching() and gt_distance < 1.5:
         #     move_speed = min(move_speed, -0.3)
+        
+        # 渲染2D可视化帧（在获取waypoint之后）
+        self._render_2d_frame()
         
         return [move_speed, y_speed, yaw_speed]
 
@@ -391,6 +392,7 @@ class OracleBaselineAgent(AgentConfig):
         
         # 尝试用 navmesh 获取路径点
         waypoint = self._get_navmesh_waypoint(target_pos)
+        self.current_waypoint = waypoint  # 保存用于可视化
         print("[debug]navmesh waypoint: ", waypoint)
         
         if waypoint is not None:
@@ -579,10 +581,28 @@ class OracleBaselineAgent(AgentConfig):
         cv2.circle(img, target_px, 8, (100, 100, 255), -1)
         cv2.circle(img, target_px, 8, (255, 255, 255), 2)
         
+        # Waypoint: 绿色菱形
+        if self.current_waypoint is not None:
+            wp_x, wp_z = float(self.current_waypoint[0]), float(self.current_waypoint[2])
+            wp_px = self._world_to_pixel(wp_x, wp_z)
+            # 画菱形 (用四个点)
+            d = 6  # 菱形半径
+            pts = np.array([
+                [wp_px[0], wp_px[1] - d],  # 上
+                [wp_px[0] + d, wp_px[1]],  # 右
+                [wp_px[0], wp_px[1] + d],  # 下
+                [wp_px[0] - d, wp_px[1]],  # 左
+            ], dtype=np.int32)
+            cv2.fillPoly(img, [pts], (0, 255, 0))  # 绿色填充
+            cv2.polylines(img, [pts], True, (255, 255, 255), 1)  # 白色边框
+            # 画从 robot 到 waypoint 的虚线
+            cv2.line(img, robot_px, wp_px, (0, 200, 0), 1, cv2.LINE_AA)
+        
         # 添加图例
         cv2.putText(img, "Robot", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 100), 2)
         cv2.putText(img, "Target", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)
-        cv2.putText(img, f"Step: {len(self.robot_trajectory)}", (10, 75), 
+        cv2.putText(img, "Waypoint", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(img, f"Step: {len(self.robot_trajectory)}", (10, 100), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
         # 转换为RGB（cv2默认BGR）
