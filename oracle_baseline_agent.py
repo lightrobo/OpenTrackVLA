@@ -266,66 +266,11 @@ class OracleBaselineAgent(AgentConfig):
         
         rgb = observations["agent_1_articulated_agent_jaw_rgb"]
         rgb_ = rgb[:, :, :3]
-        height, width = rgb_.shape[:2]
         self.rgb_list.append(rgb_)
         
-        gt_distance = self._get_gt_distance()
-        
-        # ============================================================
-        # 1. PD 控制 (和 Baseline 完全一样)
-        # ============================================================
         action = [0.0, 0.0, 0.0]
-        # target_visible = False
-        
-        # 1.1 尝试 panoptic
-        # if self.target_id is not None and "agent_1_articulated_agent_jaw_panoptic" in observations:
-        #     panoptic = observations["agent_1_articulated_agent_jaw_panoptic"]
-        #     target_mask = (panoptic == self.target_id)
-        #     if hasattr(target_mask, "ndim") and target_mask.ndim == 3:
-        #         target_mask = target_mask[:, :, 0]
-            
-        #     if np.any(target_mask):
-        #         rows = np.any(target_mask, axis=1)
-        #         cols = np.any(target_mask, axis=0)
-        #         r_idx = np.where(rows)[0]
-        #         c_idx = np.where(cols)[0]
-        #         cmin, cmax = int(c_idx[0]), int(c_idx[-1])
-        #         rmin, rmax = int(r_idx[0]), int(r_idx[-1])
-                
-        #         center_x = (cmin + cmax) / (2 * width)
-        #         bbox_area = (cmax - cmin) * (rmax - rmin)
-                
-        #         action = self._pd_control(center_x, bbox_area)
-        #         target_visible = True
-        
-        # 1.2 回退到 detector
-        # if not target_visible and detector['agent_1_main_humanoid_detector_sensor']['facing']:
-        #     box = detector['agent_1_main_humanoid_detector_sensor']['box']
-        #     center_x = (box[0] + box[2]) / (2 * width)
-        #     bbox_area = (box[2] - box[0]) * (box[3] - box[1])
-            
-        #     action = self._pd_control(center_x, bbox_area)
-        #     target_visible = True
-        
-        # 1.3 目标不可见 - 搜索
-        # if not target_visible:
         action = self._search_action()
-        
-        # ============================================================
-        # 2. GT 距离修正 (Oracle 独有)
-        # ============================================================
         move_speed, y_speed, yaw_speed = action
-        
-        # 2.1 太近 - 后退
-        # if gt_distance < self.DANGER_DISTANCE:
-        #     move_speed = -0.8
-        # elif gt_distance < self.MIN_DISTANCE:
-        #     back = (self.MIN_DISTANCE - gt_distance) / (self.MIN_DISTANCE - self.DANGER_DISTANCE)
-        #     move_speed = min(move_speed, -0.4 * back)
-        
-        # 2.2 目标朝我们来 - 后退
-        # if self._is_target_approaching() and gt_distance < 1.5:
-        #     move_speed = min(move_speed, -0.3)
         
         # 渲染2D可视化帧（在获取waypoint之后）
         self._render_2d_frame()
@@ -405,10 +350,21 @@ class OracleBaselineAgent(AgentConfig):
         target_pos2d = np.array([target_pos_3d[0], target_pos_3d[2]])
         waypoint2d = np.array([waypoint_3d[0], waypoint_3d[2]])
 
-        vec2_to_waypoint = robot_pos2d - waypoint2d
-        vec2_to_target = robot_pos2d - target_pos2d
-        vec2_robot_forward = np.array([1.0, 0.0])
+        # 从机器人指向 waypoint 的向量
+        vec2_to_waypoint = waypoint2d - robot_pos2d
+        vec2_to_waypoint_norm = np.linalg.norm(vec2_to_waypoint)
+        if vec2_to_waypoint_norm > 1e-6:
+            vec2_to_waypoint = vec2_to_waypoint / vec2_to_waypoint_norm
+        
+        # 获取机器人实际朝向（不是硬编码的[1,0]！）
+        base_T = self.robot.base_transformation
+        forward_3d = np.array(base_T.transform_vector([1.0, 0.0, 0.0]))
+        vec2_robot_forward = np.array([forward_3d[0], forward_3d[2]])
+        forward_norm = np.linalg.norm(vec2_robot_forward)
+        if forward_norm > 1e-6:
+            vec2_robot_forward = vec2_robot_forward / forward_norm
 
+        # cross product: 正值表示waypoint在机器人左边，需要左转（正yaw）
         angle_diff = np.cross(vec2_robot_forward, vec2_to_waypoint)
         self.angle_diff = angle_diff
         print(f"[debug] angle_diff: {angle_diff}")
