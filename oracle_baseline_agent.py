@@ -22,6 +22,7 @@ Oracle Baseline Agent v2 - 基于 Baseline 改进的专家轨迹收集器
 """
 
 import habitat
+import habitat_sim
 import warnings
 warnings.filterwarnings('ignore')
 import numpy as np
@@ -84,8 +85,8 @@ def evaluate_agent(config, dataset_split, save_path, target_id=None) -> None:
             status = 'Normal'
             info = env.get_metrics()
 
-            # 传递 sim agents 给 oracle agent
-            robot_config.set_sim_agents(humanoid_agent_main, robot_agent, other_humans)
+            # 传递 sim agents 给 oracle agent (包含 sim 用于 navmesh)
+            robot_config.set_sim_agents(humanoid_agent_main, robot_agent, other_humans, sim)
 
             while not env.episode_over:
                 record_info = {}
@@ -219,6 +220,7 @@ class OracleBaselineAgent(AgentConfig):
         self.target_human = None
         self.robot = None
         self.other_humans = []
+        self.sim = None  # 用于 navmesh
         
         # 速度估计
         self.target_pos_history = deque(maxlen=5)
@@ -229,11 +231,12 @@ class OracleBaselineAgent(AgentConfig):
         
         self.reset()
 
-    def set_sim_agents(self, target_human, robot, other_humans):
+    def set_sim_agents(self, target_human, robot, other_humans, sim=None):
         """设置 sim agents 引用"""
         self.target_human = target_human
         self.robot = robot
         self.other_humans = other_humans
+        self.sim = sim  # 用于 navmesh 路径规划
         self.target_pos_history.clear()
 
     def reset(self, episode: NavigationEpisode = None, success: bool = False):
@@ -264,6 +267,26 @@ class OracleBaselineAgent(AgentConfig):
         # 只用 XZ 平面距离 (Y 是高度)
         dist_2d = np.sqrt((robot_pos[0] - target_pos[0])**2 + (robot_pos[2] - target_pos[2])**2)
         return dist_2d
+
+    def _path_to_point(self, point):
+        """
+        使用 navmesh 获取到目标点的路径
+        
+        返回: 路径点列表，或 None（如果无法规划）
+        """
+        if self.sim is None or self.robot is None:
+            return None
+        
+        agent_pos = np.array(self.robot.base_pos)
+        
+        path = habitat_sim.ShortestPath()
+        path.requested_start = agent_pos
+        path.requested_end = np.array(point)
+        found_path = self.sim.pathfinder.find_path(path)
+        
+        if not found_path:
+            return None
+        return path.points
 
     def _is_target_approaching(self):
         """检测目标是否在朝我们移动"""
@@ -382,7 +405,41 @@ class OracleBaselineAgent(AgentConfig):
             print(f"[Oracle] Too far! dist={gt_distance:.2f}m, speeding up!")
         
         # ============================================================
-        # 5. 输出
+        # 5. Navmesh 避障修正 (防止卡墙)
+        # ============================================================
+        # 如果要前进，检查 navmesh 路径是否与当前方向一致
+        if move_speed > 0.1 and self.sim is not None:
+            target_pos = np.array([float(x) for x in self.target_human.base_pos])
+            path_points = self._path_to_point(target_pos)
+            
+            if path_points is not None and len(path_points) > 1:
+                robot_pos = np.array([float(x) for x in self.robot.base_pos])
+                next_waypoint = np.array(path_points[1])
+                to_waypoint = next_waypoint - robot_pos
+                to_waypoint_2d = np.array([to_waypoint[0], to_waypoint[2]])
+                
+                # 获取机器人朝向
+                try:
+                    import magnum as mn
+                    rot = self.robot.base_rot
+                    forward_mn = rot.transform_vector(mn.Vector3(0, 0, -1))
+                    robot_forward = np.array([float(forward_mn.x), float(forward_mn.z)])
+                except:
+                    robot_forward = np.array([0.0, -1.0])
+                
+                # 检查 waypoint 方向与当前朝向的夹角
+                waypoint_dir = to_waypoint_2d / (np.linalg.norm(to_waypoint_2d) + 1e-6)
+                robot_dir = robot_forward / (np.linalg.norm(robot_forward) + 1e-6)
+                
+                # 用 navmesh waypoint 修正转向
+                cross = robot_dir[0] * waypoint_dir[1] - robot_dir[1] * waypoint_dir[0]
+                navmesh_yaw = np.clip(cross * 2.0, -self.MAX_YAW, self.MAX_YAW)
+                
+                # 融合视觉转向和 navmesh 转向 (navmesh 权重更高)
+                yaw_speed = 0.3 * yaw_speed + 0.7 * navmesh_yaw
+        
+        # ============================================================
+        # 6. 输出
         # ============================================================
         action = [
             np.clip(move_speed, -self.MAX_BACKWARD, self.MAX_FORWARD),
@@ -394,20 +451,32 @@ class OracleBaselineAgent(AgentConfig):
 
     def _search_action(self):
         """
-        搜索动作 - 当目标不在视野内时使用 GT 位置判断转向
+        搜索动作 - 当目标不在视野内时使用 navmesh 路径规划
         
-        这是 Oracle 的核心优势：即使看不到目标，也知道该往哪转!
+        核心优势：
+        1. 即使看不到目标，也知道该往哪走
+        2. 使用 navmesh 绕过障碍物，不会卡住!
         """
         if self.target_human is None or self.robot is None:
             return [0.0, 0.0, 0.5]  # 默认: 原地旋转搜索
         
-        # 获取 GT 位置
         robot_pos = np.array([float(x) for x in self.robot.base_pos])
         target_pos = np.array([float(x) for x in self.target_human.base_pos])
         
-        # 计算目标相对于机器人的方向 (XZ 平面)
-        to_target = target_pos - robot_pos
-        to_target_2d = np.array([to_target[0], to_target[2]])  # [X, Z]
+        # ============================================================
+        # 使用 navmesh 路径规划 (核心改进!)
+        # ============================================================
+        path_points = self._path_to_point(target_pos)
+        
+        if path_points is not None and len(path_points) > 1:
+            # 跟随路径的下一个 waypoint，而不是直接往目标走
+            next_waypoint = np.array(path_points[1])
+            to_waypoint = next_waypoint - robot_pos
+            to_waypoint_2d = np.array([to_waypoint[0], to_waypoint[2]])
+        else:
+            # 无法规划路径，直接往目标走
+            to_waypoint = target_pos - robot_pos
+            to_waypoint_2d = np.array([to_waypoint[0], to_waypoint[2]])
         
         # 获取机器人朝向
         try:
@@ -416,24 +485,20 @@ class OracleBaselineAgent(AgentConfig):
             forward_mn = rot.transform_vector(mn.Vector3(0, 0, -1))
             robot_forward = np.array([float(forward_mn.x), float(forward_mn.z)])
         except:
-            robot_forward = np.array([0.0, -1.0])  # 默认朝 Z 负方向
+            robot_forward = np.array([0.0, -1.0])
         
         # 归一化
-        target_dir = to_target_2d / (np.linalg.norm(to_target_2d) + 1e-6)
+        waypoint_dir = to_waypoint_2d / (np.linalg.norm(to_waypoint_2d) + 1e-6)
         robot_dir = robot_forward / (np.linalg.norm(robot_forward) + 1e-6)
         
-        # 计算需要转向的角度
-        # cross > 0: 目标在左边，需要左转 (yaw > 0)
-        # cross < 0: 目标在右边，需要右转 (yaw < 0)
-        cross = robot_dir[0] * target_dir[1] - robot_dir[1] * target_dir[0]
+        # cross > 0: waypoint 在左边，左转 (yaw > 0)
+        # cross < 0: waypoint 在右边，右转 (yaw < 0)
+        cross = robot_dir[0] * waypoint_dir[1] - robot_dir[1] * waypoint_dir[0]
         
-        # 转向速度
         yaw_speed = np.clip(cross * 3.0, -self.MAX_YAW, self.MAX_YAW)
+        move_speed = 0.5  # 稍快一点，因为有路径规划保证不撞
         
-        # 同时前进 (边转边走)
-        move_speed = 0.3
-        
-        print(f"[Oracle] SEARCH: cross={cross:.2f}, yaw={yaw_speed:.2f}")
+        print(f"[Oracle] SEARCH with navmesh: cross={cross:.2f}, yaw={yaw_speed:.2f}")
         
         return [move_speed, 0.0, yaw_speed]
 
