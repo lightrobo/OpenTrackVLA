@@ -1,13 +1,24 @@
 """
-Oracle Baseline Agent - Uses ground truth information for expert trajectory collection.
+Oracle Baseline Agent v2 - 基于 Baseline 改进的专家轨迹收集器
 
-This agent has access to:
-- Ground truth 3D positions of all agents
-- Ground truth velocities
-- Perfect knowledge of the scene
+================================================================================
+核心设计思想
+================================================================================
 
-Purpose: Generate high-quality expert demonstrations for imitation learning.
-The trained model will only see images, but learns to mimic this oracle behavior.
+1. **保持 Baseline 的图像空间控制**
+   - 转向控制：error_t = 0.5 - center_x (目标在图像中的水平位置)
+   - 前进控制：error_f = (target_area - bbox_area) / 10000 (目标大小)
+   - 这是经过验证有效的视觉伺服方法
+
+2. **用 GT 信息增强**
+   - 2.1 防撞：当 GT 距离 < 阈值时，强制后退
+   - 2.2 追踪：当 GT 距离 > 阈值时，加速前进
+   - 2.3 目标接近时主动避让：检测目标速度朝向
+
+3. **与 Baseline 的区别**
+   - Baseline：只保存成功 episode
+   - Oracle：保存所有 episode（更多训练数据）
+   - Oracle：有防撞逻辑（产生更安全的示范）
 """
 
 import habitat
@@ -27,6 +38,7 @@ import json
 
 
 def evaluate_agent(config, dataset_split, save_path, target_id=None) -> None:
+    """评估主循环 - 与 baseline 相同结构"""
     robot_config = OracleBaselineAgent(save_path, target_id)
     with habitat.TrackEnv(
         config=config,
@@ -54,11 +66,11 @@ def evaluate_agent(config, dataset_split, save_path, target_id=None) -> None:
             except Exception:
                 instruction = None
 
-            # Get all agents
-            humanoid_agent_main = sim.agents_mgr[0].articulated_agent  # Target human
-            robot_agent = sim.agents_mgr[1].articulated_agent          # Our robot
+            # 获取 agents
+            humanoid_agent_main = sim.agents_mgr[0].articulated_agent
+            robot_agent = sim.agents_mgr[1].articulated_agent
             
-            # Get other humans (distractors) if any
+            # 其他人类 (干扰者)
             other_humans = []
             for i in range(2, len(sim.agents_mgr)):
                 try:
@@ -72,15 +84,14 @@ def evaluate_agent(config, dataset_split, save_path, target_id=None) -> None:
             status = 'Normal'
             info = env.get_metrics()
 
-            # Initialize oracle agent with sim reference
-            robot_config.set_sim_agents(sim, humanoid_agent_main, robot_agent, other_humans)
+            # 传递 sim agents 给 oracle agent
+            robot_config.set_sim_agents(humanoid_agent_main, robot_agent, other_humans)
 
             while not env.episode_over:
                 record_info = {}
                 obs = sim.get_sensor_observations()
                 detector = env.task._get_observations(env.current_episode)
                 
-                # Oracle agent uses ground truth positions
                 action = robot_config.act(obs, detector, env.current_episode.episode_id)
 
                 action_dict = {
@@ -111,7 +122,6 @@ def evaluate_agent(config, dataset_split, save_path, target_id=None) -> None:
                 record_info["dis_to_human"] = float(dist)
                 record_info["facing"] = info['human_following']
                 record_info["base_velocity"] = action
-                # Also record GT info for debugging
                 record_info["robot_pos"] = [float(x) for x in robot_agent.base_pos]
                 record_info["target_pos"] = [float(x) for x in humanoid_agent_main.base_pos]
                 record_infos.append(record_info)
@@ -136,7 +146,7 @@ def evaluate_agent(config, dataset_split, save_path, target_id=None) -> None:
             if instruction is not None:
                 result['instruction'] = instruction
 
-            # Save all episodes for diverse training data
+            # 保存所有 episode (不只是成功的)
             scene_key = osp.splitext(osp.basename(env.current_episode.scene_id))[0].split('.')[0]
             save_dir = os.path.join(save_path, scene_key)
             os.makedirs(save_dir, exist_ok=True)
@@ -145,36 +155,59 @@ def evaluate_agent(config, dataset_split, save_path, target_id=None) -> None:
             with open(os.path.join(save_dir, "{}.json".format(env.current_episode.episode_id)), "w") as f:
                 json.dump(result, f, indent=2)
 
-            robot_config.reset(env.current_episode, success=result['success'])
+            robot_config.reset(env.current_episode, success=True)  # 总是保存视频
 
 
 class OracleBaselineAgent(AgentConfig):
     """
-    Oracle agent that uses ground truth positions for expert trajectory collection.
+    Oracle Baseline Agent
     
-    Key features:
-    1. Uses GT 3D positions - no perception errors
-    2. Collision avoidance - backs off when too close
-    3. Velocity matching - predicts target motion using GT velocity
-    4. Multi-human handling - tracks main target, avoids others
-    5. Smooth, optimal control - generates clean expert demonstrations
+    ================================================================================
+    控制逻辑（与 Baseline 相同的图像空间控制 + GT 增强）
+    ================================================================================
+    
+    1. 转向控制 (yaw_speed):
+       - error_t = 0.5 - center_x
+       - 目标偏左 (center_x < 0.5) → error_t > 0 → yaw_speed > 0 → 左转
+       - 目标偏右 (center_x > 0.5) → error_t < 0 → yaw_speed < 0 → 右转
+    
+    2. 前进控制 (move_speed):
+       - error_f = (TARGET_AREA - bbox_area) / 10000
+       - 目标太小/远 → error_f > 0 → move_speed > 0 → 前进
+       - 目标太大/近 → error_f < 0 → move_speed < 0 → 后退
+    
+    3. GT 增强（Oracle 独有）:
+       - 3.1 当 GT 距离 < MIN_DISTANCE: 强制后退
+       - 3.2 当 GT 距离 > MAX_DISTANCE: 增加前进速度
+       - 3.3 当目标朝我们移动: 预先后退
     """
     
-    # Target following parameters
-    IDEAL_DISTANCE = 1.8        # meters - ideal following distance
-    MIN_DISTANCE = 1.0          # meters - start backing off
-    DANGER_DISTANCE = 0.7       # meters - urgent back off
-    MAX_DISTANCE = 3.5          # meters - speed up to catch up
+    # ============================================================
+    # 参数配置
+    # ============================================================
     
-    # Control gains
-    MAX_FORWARD_SPEED = 1.5     # m/s
-    MAX_BACKWARD_SPEED = 0.8    # m/s
-    MAX_LATERAL_SPEED = 0.5     # m/s
-    MAX_YAW_SPEED = 1.5         # rad/s
+    # GT 距离阈值 (米)
+    DANGER_DISTANCE = 0.8       # 紧急后退
+    MIN_DISTANCE = 1.2          # 开始后退
+    IDEAL_DISTANCE = 2.0        # 理想距离
+    MAX_DISTANCE = 3.0          # 开始加速
+    
+    # 图像空间目标面积 (像素²)
+    TARGET_AREA = 25000         # 理想 bbox 面积 (比 baseline 的 30000 小一点，保持更远距离)
+    
+    # PD 控制增益 (与 Baseline 相同)
+    KP_T = 2.0                  # 转向比例
+    KP_F = 1.0                  # 前进比例
+    KP_Y = 0.5                  # 横移比例
+    
+    # 速度限制
+    MAX_FORWARD = 2.0
+    MAX_BACKWARD = 1.0
+    MAX_YAW = 2.0
     
     def __init__(self, result_path, target_id=None):
         super().__init__()
-        print("Initialize Oracle baseline agent (uses GT positions)")
+        print("Initialize Oracle Baseline Agent v2")
 
         self.result_path = result_path
         os.makedirs(self.result_path, exist_ok=True)
@@ -182,33 +215,29 @@ class OracleBaselineAgent(AgentConfig):
         
         self.rgb_list = []
         
-        # Sim references (set by evaluate_agent)
-        self.sim = None
+        # GT agents (由 set_sim_agents 设置)
         self.target_human = None
         self.robot = None
         self.other_humans = []
         
-        # Velocity estimation from position history
+        # 速度估计
         self.target_pos_history = deque(maxlen=5)
-        self.robot_pos_history = deque(maxlen=5)
         
-        # Action smoothing
-        self.last_action = np.array([0.0, 0.0, 0.0])
-        self.action_smoothing = 0.5
-        
-        # Small noise for data diversity
-        self.noise_scale = 0.02
+        # 误差历史 (PD 控制)
+        self.prev_error_t = 0
+        self.prev_error_f = 0
         
         self.reset()
 
-    def set_sim_agents(self, sim, target_human, robot, other_humans):
-        """Set references to sim agents for GT access."""
-        self.sim = sim
+    def set_sim_agents(self, target_human, robot, other_humans):
+        """设置 sim agents 引用"""
         self.target_human = target_human
         self.robot = robot
         self.other_humans = other_humans
+        self.target_pos_history.clear()
 
     def reset(self, episode: NavigationEpisode = None, success: bool = False):
+        """重置 + 保存视频"""
         if len(self.rgb_list) != 0 and episode is not None:
             scene_key = osp.splitext(osp.basename(episode.scene_id))[0].split('.')[0]
             save_dir = os.path.join(self.result_path, scene_key)
@@ -218,172 +247,225 @@ class OracleBaselineAgent(AgentConfig):
             self.rgb_list = []
         
         self.target_pos_history.clear()
-        self.robot_pos_history.clear()
-        self.last_action = np.array([0.0, 0.0, 0.0])
+        self.prev_error_t = 0
+        self.prev_error_f = 0
 
-    def _get_gt_positions(self):
-        """Get ground truth 3D positions."""
+    def _get_gt_distance(self):
+        """获取 GT 距离 (米)"""
+        if self.target_human is None or self.robot is None:
+            return 2.0  # 默认值
+        
         robot_pos = np.array([float(x) for x in self.robot.base_pos])
         target_pos = np.array([float(x) for x in self.target_human.base_pos])
         
-        # Store for velocity estimation
-        self.robot_pos_history.append(robot_pos.copy())
+        # 存储历史
         self.target_pos_history.append(target_pos.copy())
         
-        return robot_pos, target_pos
+        # 只用 XZ 平面距离 (Y 是高度)
+        dist_2d = np.sqrt((robot_pos[0] - target_pos[0])**2 + (robot_pos[2] - target_pos[2])**2)
+        return dist_2d
 
-    def _estimate_target_velocity(self):
-        """Estimate target velocity from position history."""
-        if len(self.target_pos_history) < 2:
-            return np.array([0.0, 0.0, 0.0])
+    def _is_target_approaching(self):
+        """检测目标是否在朝我们移动"""
+        if len(self.target_pos_history) < 3:
+            return False
         
-        # Simple finite difference (could use more sophisticated filtering)
-        dt = 0.1  # assume 10 Hz
-        vel = (self.target_pos_history[-1] - self.target_pos_history[-2]) / dt
-        return vel
-
-    def _get_robot_heading(self):
-        """Get robot's current heading direction."""
-        # Robot forward direction in world frame
-        rot = self.robot.base_rot
-        # Convert quaternion to forward vector (assuming z-forward convention)
-        # This depends on the specific coordinate system used
-        forward = np.array([0, 0, -1])  # Default forward
-        try:
-            import magnum as mn
-            forward = rot.transform_vector(mn.Vector3(0, 0, -1))
-            forward = np.array([forward.x, forward.y, forward.z])
-        except:
-            pass
-        return forward
-
-    def _compute_avoidance_for_others(self, robot_pos):
-        """Compute avoidance vector for other humans (distractors)."""
-        avoidance = np.array([0.0, 0.0, 0.0])
+        robot_pos = np.array([float(x) for x in self.robot.base_pos])
         
-        for human in self.other_humans:
-            try:
-                human_pos = np.array([float(x) for x in human.base_pos])
-                diff = robot_pos - human_pos
-                dist = np.linalg.norm(diff)
-                
-                if dist < 1.5:  # Avoidance radius
-                    # Push away from distractor
-                    if dist > 0.1:
-                        avoidance += (diff / dist) * (1.5 - dist) * 0.5
-            except:
-                pass
+        # 计算目标位移
+        prev_pos = self.target_pos_history[-3]
+        curr_pos = self.target_pos_history[-1]
+        target_vel = curr_pos - prev_pos
         
-        return avoidance
+        # 目标到机器人的方向
+        to_robot = robot_pos - curr_pos
+        to_robot_2d = np.array([to_robot[0], to_robot[2]])
+        to_robot_norm = np.linalg.norm(to_robot_2d)
+        if to_robot_norm < 0.01:
+            return False
+        to_robot_2d = to_robot_2d / to_robot_norm
+        
+        # 目标速度在朝向机器人方向的投影
+        target_vel_2d = np.array([target_vel[0], target_vel[2]])
+        approach_speed = np.dot(target_vel_2d, to_robot_2d)
+        
+        return approach_speed > 0.05  # 阈值
 
     def act(self, observations, detector, episode_id):
+        """
+        主控制函数
+        
+        逻辑流程:
+        1. 获取图像和 GT 信息
+        2. 用图像空间 PD 控制 (和 Baseline 一样)
+        3. 用 GT 距离修正 (防撞)
+        """
         self.episode_id = episode_id
         
-        # Get RGB for saving
+        # ============================================================
+        # 1. 图像预处理
+        # ============================================================
         rgb = observations["agent_1_articulated_agent_jaw_rgb"]
         rgb_ = rgb[:, :, :3]
+        height, width = rgb_.shape[:2]
         self.rgb_list.append(rgb_)
         
-        # === ORACLE: Use ground truth positions ===
-        robot_pos, target_pos = self._get_gt_positions()
+        # ============================================================
+        # 2. 获取 GT 距离
+        # ============================================================
+        gt_distance = self._get_gt_distance()
+        target_approaching = self._is_target_approaching()
         
-        # Vector from robot to target (in world frame, XZ plane)
-        to_target = target_pos - robot_pos
-        to_target_2d = np.array([to_target[0], to_target[2]])  # XZ plane
-        distance = np.linalg.norm(to_target_2d)
+        # ============================================================
+        # 3. 图像空间控制 (和 Baseline 完全一样)
+        # ============================================================
+        action = [0.0, 0.0, 0.0]
+        target_visible = False
         
-        # Estimate target velocity for prediction
-        target_vel = self._estimate_target_velocity()
-        target_vel_2d = np.array([target_vel[0], target_vel[2]])
+        # 3.1 尝试 panoptic 分割
+        if self.target_id is not None and "agent_1_articulated_agent_jaw_panoptic" in observations:
+            panoptic = observations["agent_1_articulated_agent_jaw_panoptic"]
+            target_mask = (panoptic == self.target_id)
+            if hasattr(target_mask, "ndim") and target_mask.ndim == 3:
+                target_mask = target_mask[:, :, 0]
+            
+            if np.any(target_mask):
+                rows = np.any(target_mask, axis=1)
+                cols = np.any(target_mask, axis=0)
+                r_idx = np.where(rows)[0]
+                c_idx = np.where(cols)[0]
+                rmin, rmax = int(r_idx[0]), int(r_idx[-1])
+                cmin, cmax = int(c_idx[0]), int(c_idx[-1])
+                
+                center_x = (cmin + cmax) / (2 * width)
+                bbox_area = (cmax - cmin) * (rmax - rmin)
+                
+                action = self._compute_pd_action(center_x, bbox_area)
+                target_visible = True
         
-        # Predict where target will be in ~0.5 seconds
-        prediction_horizon = 0.5
-        predicted_target = target_pos + target_vel * prediction_horizon
-        to_predicted = predicted_target - robot_pos
-        to_predicted_2d = np.array([to_predicted[0], to_predicted[2]])
+        # 3.2 回退到 detector
+        if not target_visible and detector['agent_1_main_humanoid_detector_sensor']['facing']:
+            box = detector['agent_1_main_humanoid_detector_sensor']['box']
+            center_x = (box[0] + box[2]) / (2 * width)
+            bbox_area = (box[2] - box[0]) * (box[3] - box[1])
+            
+            action = self._compute_pd_action(center_x, bbox_area)
+            target_visible = True
         
-        # Get robot heading
-        robot_heading = self._get_robot_heading()
-        robot_heading_2d = np.array([robot_heading[0], robot_heading[2]])
-        robot_heading_2d = robot_heading_2d / (np.linalg.norm(robot_heading_2d) + 1e-6)
+        # 3.3 目标不可见 - 使用 GT 位置搜索!
+        if not target_visible:
+            action = self._search_action()
         
-        # Compute angle to target
-        if distance > 0.01:
-            to_target_dir = to_target_2d / distance
-        else:
-            to_target_dir = robot_heading_2d
+        # ============================================================
+        # 4. GT 距离修正 (Oracle 独有)
+        # ============================================================
+        move_speed, y_speed, yaw_speed = action
         
-        # Cross product for turn direction (positive = turn left)
-        cross = robot_heading_2d[0] * to_target_dir[1] - robot_heading_2d[1] * to_target_dir[0]
-        dot = np.dot(robot_heading_2d, to_target_dir)
-        angle_error = np.arctan2(cross, dot)  # Signed angle
+        # 4.1 防撞: 太近则后退
+        if gt_distance < self.DANGER_DISTANCE:
+            move_speed = -self.MAX_BACKWARD  # 紧急后退
+            print(f"[Oracle] DANGER! dist={gt_distance:.2f}m, backing off!")
+        elif gt_distance < self.MIN_DISTANCE:
+            # 线性插值后退
+            back_factor = (self.MIN_DISTANCE - gt_distance) / (self.MIN_DISTANCE - self.DANGER_DISTANCE)
+            move_speed = min(move_speed, -self.MAX_BACKWARD * back_factor * 0.5)
+            print(f"[Oracle] Too close! dist={gt_distance:.2f}m")
         
-        # === CONTROL LOGIC ===
+        # 4.2 目标朝我们来 - 预先后退
+        if target_approaching and gt_distance < self.IDEAL_DISTANCE:
+            move_speed = min(move_speed, -0.3)
+            print(f"[Oracle] Target approaching!")
         
-        # 1. YAW: Turn toward (predicted) target
-        yaw_speed = np.clip(angle_error * 2.0, -self.MAX_YAW_SPEED, self.MAX_YAW_SPEED)
+        # 4.3 太远 - 加速追
+        if gt_distance > self.MAX_DISTANCE:
+            move_speed = max(move_speed, self.MAX_FORWARD * 0.8)
+            print(f"[Oracle] Too far! dist={gt_distance:.2f}m, speeding up!")
         
-        # 2. FORWARD/BACKWARD: Distance control with collision avoidance
-        if distance < self.DANGER_DISTANCE:
-            # Too close! Back off urgently
-            forward_speed = -self.MAX_BACKWARD_SPEED
-        elif distance < self.MIN_DISTANCE:
-            # Getting close, slow back off
-            back_factor = (self.MIN_DISTANCE - distance) / (self.MIN_DISTANCE - self.DANGER_DISTANCE)
-            forward_speed = -self.MAX_BACKWARD_SPEED * back_factor * 0.5
-        elif distance > self.MAX_DISTANCE:
-            # Too far, speed up
-            forward_speed = self.MAX_FORWARD_SPEED
-        elif distance > self.IDEAL_DISTANCE:
-            # A bit far, move forward
-            approach_factor = (distance - self.IDEAL_DISTANCE) / (self.MAX_DISTANCE - self.IDEAL_DISTANCE)
-            forward_speed = self.MAX_FORWARD_SPEED * approach_factor * 0.8
-        else:
-            # In ideal range, match target speed
-            target_speed_toward_robot = -np.dot(target_vel_2d, to_target_dir)
-            if target_speed_toward_robot > 0.3:
-                # Target approaching us - back off a bit
-                forward_speed = -0.3
-            else:
-                # Match roughly
-                forward_speed = np.linalg.norm(target_vel_2d) * 0.5
+        # ============================================================
+        # 5. 输出
+        # ============================================================
+        action = [
+            np.clip(move_speed, -self.MAX_BACKWARD, self.MAX_FORWARD),
+            np.clip(y_speed, -0.5, 0.5),
+            np.clip(yaw_speed, -self.MAX_YAW, self.MAX_YAW)
+        ]
         
-        # 3. LATERAL: Small lateral adjustments for smooth tracking
-        # Move laterally if target is to the side and we're not facing them
-        if abs(angle_error) > 0.3:
-            lateral_speed = np.sign(angle_error) * self.MAX_LATERAL_SPEED * 0.3
-        else:
-            lateral_speed = 0.0
-        
-        # 4. Avoid other humans (distractors)
-        avoidance = self._compute_avoidance_for_others(robot_pos)
-        if np.linalg.norm(avoidance) > 0.1:
-            # Add avoidance to forward/lateral
-            avoidance_forward = np.dot(avoidance[[0, 2]], robot_heading_2d)
-            avoidance_lateral = avoidance[0] * (-robot_heading_2d[1]) + avoidance[2] * robot_heading_2d[0]
-            forward_speed += avoidance_forward * 0.5
-            lateral_speed += avoidance_lateral * 0.5
-        
-        # 5. Special case: if target is behind us, prioritize turning
-        if dot < 0:  # Target behind
-            forward_speed = 0.0
-            yaw_speed = np.sign(angle_error) * self.MAX_YAW_SPEED
-        
-        # === SMOOTHING AND OUTPUT ===
-        action = np.array([forward_speed, lateral_speed, yaw_speed])
-        
-        # Smooth action
-        action = self.action_smoothing * self.last_action + (1 - self.action_smoothing) * action
-        self.last_action = action.copy()
-        
-        # Add small noise for diversity
-        noise = np.random.normal(0, self.noise_scale, size=3)
-        action = action + noise
-        
-        # Clip to bounds
-        action[0] = np.clip(action[0], -self.MAX_BACKWARD_SPEED, self.MAX_FORWARD_SPEED)
-        action[1] = np.clip(action[1], -self.MAX_LATERAL_SPEED, self.MAX_LATERAL_SPEED)
-        action[2] = np.clip(action[2], -self.MAX_YAW_SPEED, self.MAX_YAW_SPEED)
-        
-        return action.tolist()
+        return action
 
+    def _search_action(self):
+        """
+        搜索动作 - 当目标不在视野内时使用 GT 位置判断转向
+        
+        这是 Oracle 的核心优势：即使看不到目标，也知道该往哪转!
+        """
+        if self.target_human is None or self.robot is None:
+            return [0.0, 0.0, 0.5]  # 默认: 原地旋转搜索
+        
+        # 获取 GT 位置
+        robot_pos = np.array([float(x) for x in self.robot.base_pos])
+        target_pos = np.array([float(x) for x in self.target_human.base_pos])
+        
+        # 计算目标相对于机器人的方向 (XZ 平面)
+        to_target = target_pos - robot_pos
+        to_target_2d = np.array([to_target[0], to_target[2]])  # [X, Z]
+        
+        # 获取机器人朝向
+        try:
+            import magnum as mn
+            rot = self.robot.base_rot
+            forward_mn = rot.transform_vector(mn.Vector3(0, 0, -1))
+            robot_forward = np.array([float(forward_mn.x), float(forward_mn.z)])
+        except:
+            robot_forward = np.array([0.0, -1.0])  # 默认朝 Z 负方向
+        
+        # 归一化
+        target_dir = to_target_2d / (np.linalg.norm(to_target_2d) + 1e-6)
+        robot_dir = robot_forward / (np.linalg.norm(robot_forward) + 1e-6)
+        
+        # 计算需要转向的角度
+        # cross > 0: 目标在左边，需要左转 (yaw > 0)
+        # cross < 0: 目标在右边，需要右转 (yaw < 0)
+        cross = robot_dir[0] * target_dir[1] - robot_dir[1] * target_dir[0]
+        
+        # 转向速度
+        yaw_speed = np.clip(cross * 3.0, -self.MAX_YAW, self.MAX_YAW)
+        
+        # 同时前进 (边转边走)
+        move_speed = 0.3
+        
+        print(f"[Oracle] SEARCH: cross={cross:.2f}, yaw={yaw_speed:.2f}")
+        
+        return [move_speed, 0.0, yaw_speed]
+
+    def _compute_pd_action(self, center_x, bbox_area):
+        """
+        PD 控制计算 - 与 Baseline 完全相同
+        
+        输入:
+            center_x: 目标中心 x 坐标 (归一化, 0-1)
+            bbox_area: 边界框面积 (像素²)
+        
+        输出:
+            [move_speed, y_speed, yaw_speed]
+        """
+        # 转向误差: 目标应该在图像中心 (center_x = 0.5)
+        error_t = 0.5 - center_x
+        
+        # 前进误差: 目标应该有理想大小 (bbox_area = TARGET_AREA)
+        error_f = (self.TARGET_AREA - bbox_area) / 10000
+        if abs(error_f) < 0.5:  # 死区
+            error_f = 0
+        
+        # PD 控制
+        derivative_t = error_t - self.prev_error_t
+        derivative_f = error_f - self.prev_error_f
+        
+        yaw_speed = self.KP_T * error_t  # + KD_T * derivative_t (未使用)
+        move_speed = self.KP_F * error_f  # + KD_F * derivative_f (未使用)
+        y_speed = self.KP_Y * error_t
+        
+        # 更新历史
+        self.prev_error_t = error_t
+        self.prev_error_f = error_f
+        
+        return [move_speed, y_speed, yaw_speed]
