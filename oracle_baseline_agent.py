@@ -188,6 +188,7 @@ class OracleBaselineAgent(AgentConfig):
         self.world_bounds = None  # (x_min, x_max, z_min, z_max)
         self.robot_trajectory = []  # 记录轨迹
         self.target_trajectory = []
+        self.angle_diff = 0.0
         
         self.target_pos_history = deque(maxlen=5)
         self.prev_error_t = 0
@@ -207,6 +208,7 @@ class OracleBaselineAgent(AgentConfig):
         self.world_bounds = None
         self.robot_trajectory = []
         self.target_trajectory = []
+        self.angle_diff = 0.0
 
     def reset(self, episode: NavigationEpisode = None, success: bool = False):
         if len(self.rgb_list) != 0 and episode is not None:
@@ -273,7 +275,7 @@ class OracleBaselineAgent(AgentConfig):
         # 1. PD 控制 (和 Baseline 完全一样)
         # ============================================================
         action = [0.0, 0.0, 0.0]
-        target_visible = False
+        # target_visible = False
         
         # 1.1 尝试 panoptic
         # if self.target_id is not None and "agent_1_articulated_agent_jaw_panoptic" in observations:
@@ -306,8 +308,8 @@ class OracleBaselineAgent(AgentConfig):
         #     target_visible = True
         
         # 1.3 目标不可见 - 搜索
-        if not target_visible:
-            action = self._search_action()
+        # if not target_visible:
+        action = self._search_action()
         
         # ============================================================
         # 2. GT 距离修正 (Oracle 独有)
@@ -385,49 +387,40 @@ class OracleBaselineAgent(AgentConfig):
         2. 无 navmesh → 直接往目标方向走
         """
         if self.target_human is None or self.robot is None:
-            return [0.0, 0.0, 0.5]  # 默认旋转
+            print(f"[debug] target_human: {self.target_human}; robot: {self.robot}")
+            return [0.0, 0.0, 0.0]  
         
-        robot_pos = np.array([float(x) for x in self.robot.base_pos])
-        target_pos = np.array([float(x) for x in self.target_human.base_pos])
+        robot_pos_3d = np.array([float(x) for x in self.robot.base_pos])
+        target_pos_3d = np.array([float(x) for x in self.target_human.base_pos])
         
         # 尝试用 navmesh 获取路径点
-        waypoint = self._get_navmesh_waypoint(target_pos)
-        self.current_waypoint = waypoint  # 保存用于可视化
-        print("[debug]navmesh waypoint: ", waypoint)
-        
-        if waypoint is not None:
-            # 用 navmesh waypoint (绕障碍物)
-            to_waypoint = waypoint - robot_pos
-            goal_2d = np.array([to_waypoint[0], to_waypoint[2]])
-        else:
-            # 直接往目标走
-            to_target = target_pos - robot_pos
-            goal_2d = np.array([to_target[0], to_target[2]])
-        
-        # 机器人朝向
-        # try:
-        #     import magnum as mn
-        #     rot = self.robot.base_rot
-        #     forward = rot.transform_vector(mn.Vector3(0, 0, -1))
-        #     robot_forward = np.array([float(forward.x), float(forward.z)])
-        # except:
-        robot_forward = np.array([0.0, -1.0])
-        
-        # 归一化
-        goal_dir = goal_2d / (np.linalg.norm(goal_2d) + 1e-6)
-        robot_dir = robot_forward / (np.linalg.norm(robot_forward) + 1e-6)
-        
-        # 叉积判断转向
-        cross = robot_dir[0] * goal_dir[1] - robot_dir[1] * goal_dir[0]
-        
-        # yaw > 0 = 左转，所以取负号
-        yaw_speed = -cross * 2.0
-        yaw_speed = np.clip(yaw_speed, -2.0, 2.0)
-        
-        # 边转边走
+        waypoint_3d = self._get_navmesh_waypoint(target_pos_3d)
+        self.current_waypoint = waypoint_3d  # 保存用于可视化
+
+        # print(f"[debug] waypoint: {waypoint_3d}")
+        # print(f"[debug] robot_pos: {robot_pos_3d}")
+        # print(f"[debug] target_pos: {target_pos_3d}")
+
+        robot_pos2d = np.array([robot_pos_3d[0], robot_pos_3d[2]])
+        target_pos2d = np.array([target_pos_3d[0], target_pos_3d[2]])
+        waypoint2d = np.array([waypoint_3d[0], waypoint_3d[2]])
+
+        vec2_to_waypoint = robot_pos2d - waypoint2d
+        vec2_to_target = robot_pos2d - target_pos2d
+        vec2_robot_forward = np.array([1.0, 0.0])
+
+        angle_diff = np.cross(vec2_robot_forward, vec2_to_waypoint)
+        self.angle_diff = angle_diff
+        print(f"[debug] angle_diff: {angle_diff}")
+        yaw_speed = -angle_diff * 2.0
+        yaw_speed = np.clip(yaw_speed, -1.0, 1.0)
+
         move_speed = 0.3
+
+        return [move_speed, 0.0, yaw_speed]
+
         
-        return [move_speed, 0.0, 0.0]
+
 
     # ================================================================
     # 2D 可视化
@@ -577,6 +570,24 @@ class OracleBaselineAgent(AgentConfig):
         cv2.circle(img, robot_px, 8, (255, 200, 100), -1)  # 填充
         cv2.circle(img, robot_px, 8, (255, 255, 255), 2)   # 白色边框
         
+        # Robot 朝向：蓝色线段
+        try:
+            base_T = self.robot.base_transformation
+            forward_3d = np.array(base_T.transform_vector([1.0, 0.0, 0.0]))
+            forward_2d = np.array([forward_3d[0], forward_3d[2]])
+            # 归一化并缩放（世界坐标系中的长度）
+            forward_len = np.linalg.norm(forward_2d)
+            if forward_len > 1e-6:
+                forward_2d = forward_2d / forward_len
+            arrow_length = 1.0  # 世界坐标系中1米长
+            arrow_end_world = (robot_x + forward_2d[0] * arrow_length, 
+                               robot_z + forward_2d[1] * arrow_length)
+            arrow_end_px = self._world_to_pixel(*arrow_end_world)
+            # 画蓝色朝向线段
+            cv2.line(img, robot_px, arrow_end_px, (255, 100, 100), 3, cv2.LINE_AA)
+        except Exception:
+            pass  # 如果获取朝向失败，跳过
+        
         # Target: 红色圆
         cv2.circle(img, target_px, 8, (100, 100, 255), -1)
         cv2.circle(img, target_px, 8, (255, 255, 255), 2)
@@ -603,6 +614,9 @@ class OracleBaselineAgent(AgentConfig):
         cv2.putText(img, "Target", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2)
         cv2.putText(img, "Waypoint", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         cv2.putText(img, f"Step: {len(self.robot_trajectory)}", (10, 100), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+        cv2.putText(img, f"Angle Diff: {self.angle_diff:.2f}", (10, 125), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
         # 转换为RGB（cv2默认BGR）
