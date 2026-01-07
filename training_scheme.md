@@ -223,6 +223,83 @@ python train.py \
 
 ---
 
+## LLM Backbone 训练策略
+
+### 默认配置：全量微调 (Full Fine-tuning)
+
+```python
+# train.py 第 269 行
+@dataclass
+class ModelConfig:
+    llm_name: str = "Qwen/Qwen3-0.6B"
+    freeze_llm: bool = False  # ← 训练时默认不冻结
+
+# train.py 第 284 行
+self.llm.requires_grad_(not cfg.freeze_llm)  # False → 全部可训练
+```
+
+### 训练策略对比
+
+| 问题 | 答案 |
+|------|------|
+| LLM 冻结吗？ | **默认不冻结** (`freeze_llm=False`) |
+| 使用 LoRA 吗？ | **没有**，代码中无任何 peft/lora |
+| 部分冻结？ | **没有**，只有全冻结或全解冻两种模式 |
+| 训练哪些参数？ | **全部参数** (LLM + Projector + TVI + Planner) |
+
+### 两种模式
+
+| 配置 | 可训练参数 | 用途 |
+|------|-----------|------|
+| `freeze_llm=False` (train.py 默认) | LLM + Projector + TVI + Planner | 训练时全量微调 |
+| `freeze_llm=True` (model.py 默认) | Projector + TVI + Planner | 推理时冻结，或轻量训练 |
+
+### 参数统计日志
+
+训练开始时会打印参数统计：
+
+```python
+# train.py 第 837-840 行
+total_params = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"[PARAMS] total={total_params:,} trainable={trainable_params:,} ({pct:.2f}%)")
+```
+
+当 `freeze_llm=False` 时，输出类似：
+```
+[PARAMS] total=600,000,000 trainable=600,000,000 (100.00%)
+[PARAMS groups] llm:600000000/600000000 proj:xxx/xxx tvi:xxx/xxx planner:xxx/xxx
+```
+
+### 注意：不同文件默认值不同
+
+| 文件 | 默认值 | 用途 |
+|------|--------|------|
+| `train.py` | `freeze_llm=False` | 训练脚本，全量微调 |
+| `model.py` | `freeze_llm=True` | 推理脚本，冻结 LLM |
+| `open_trackvla_hf/` | `freeze_llm=True` | HuggingFace 格式，冻结 LLM |
+
+### 如需添加 LoRA 支持
+
+当前代码**不支持 LoRA**，需要手动添加：
+
+```python
+from peft import LoraConfig, get_peft_model
+
+# 在 OpenTrackVLA.__init__ 中添加
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+    lora_dropout=0.05,
+)
+self.llm = get_peft_model(self.llm, lora_config)
+```
+
+这样可以大幅减少可训练参数量（约 0.1%~1%），同时保持较好的性能。
+
+---
+
 ## 总结
 
 1. **不需要 tokenize 连续值** — LLM 接收 `inputs_embeds`，不是 `input_ids`
@@ -230,4 +307,5 @@ python train.py \
 3. **MLP 直接回归** — 输出 (x, y, θ) × 8 个 waypoints
 4. **Loss 是 MSE** — 简单的均方误差，带有效 waypoint 掩码
 5. **训练简单稳定** — 不需要复杂的 diffusion scheduler 或采样策略
+6. **LLM 默认全量微调** — `freeze_llm=False`，无 LoRA，无部分冻结
 
