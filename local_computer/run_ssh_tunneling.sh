@@ -31,7 +31,8 @@ if lsof -i :${LOCAL_PORT} > /dev/null 2>&1; then
 fi
 
 # 构建SSH命令
-SSH_CMD="ssh -N -L ${LOCAL_PORT}:localhost:${REMOTE_PORT}"
+# 绑定到 0.0.0.0 使得局域网内其他设备（如 AGX Orin）可以连接
+SSH_CMD="ssh -N -L 0.0.0.0:${LOCAL_PORT}:localhost:${REMOTE_PORT}"
 
 # 如果指定了SSH密钥
 if [ -n "${SSH_KEY}" ]; then
