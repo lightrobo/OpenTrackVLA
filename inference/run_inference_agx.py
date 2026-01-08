@@ -64,6 +64,7 @@ class CameraInference:
         self,
         model_dir: str,
         dinov3_model_path: Optional[str] = None,
+        siglip_model_path: Optional[str] = None,
         history: int = 31,
         device: str = "cuda",
         camera_idx: int = 0
@@ -74,6 +75,7 @@ class CameraInference:
         Args:
             model_dir: OpenTrackVLA模型目录（HuggingFace格式）
             dinov3_model_path: DINOv3模型路径（可选，会从环境变量读取）
+            siglip_model_path: SigLIP模型路径（可选）
             history: 历史帧数量（默认31）
             device: 计算设备（cuda/cpu）
             camera_idx: 摄像头索引
@@ -120,7 +122,8 @@ class CameraInference:
         vision_cfg = VisionCacheConfig(
             image_size=384,
             batch_size=1,
-            device=str(self.device)
+            device=str(self.device),
+            siglip_model_name=siglip_model_path if siglip_model_path else None
         )
         self.vision_encoder = VisionFeatureCacher(vision_cfg)
         self.vision_encoder.eval()
@@ -390,6 +393,12 @@ def main():
         help="DINOv3模型路径"
     )
     parser.add_argument(
+        "--siglip_path",
+        type=str,
+        default=None,
+        help="SigLIP模型路径（可选，默认从HuggingFace Hub下载）"
+    )
+    parser.add_argument(
         "--history",
         type=int,
         default=31,
@@ -419,22 +428,29 @@ def main():
     
     # 展开路径
     model_dir = os.path.expanduser(args.model_dir)
-    dinov3_path = os.path.expanduser(args.dinov3_path)
+    dinov3_path = os.path.expanduser(args.dinov3_path) if args.dinov3_path else None
+    siglip_path = os.path.expanduser(args.siglip_path) if args.siglip_path else None
     
     # 检查路径
     if not os.path.exists(model_dir):
         print(f"错误: 模型目录不存在: {model_dir}")
         sys.exit(1)
     
-    if not os.path.exists(dinov3_path):
+    if dinov3_path and not os.path.exists(dinov3_path):
         print(f"警告: DINOv3路径不存在: {dinov3_path}")
         print("将使用HuggingFace默认路径")
         dinov3_path = None
+    
+    if siglip_path and not os.path.exists(siglip_path):
+        print(f"警告: SigLIP路径不存在: {siglip_path}")
+        print("将使用HuggingFace默认路径")
+        siglip_path = None
     
     # 创建推理器并运行
     inferencer = CameraInference(
         model_dir=model_dir,
         dinov3_model_path=dinov3_path,
+        siglip_model_path=siglip_path,
         history=args.history,
         device=args.device,
         camera_idx=args.camera

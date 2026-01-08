@@ -232,17 +232,51 @@ class VisionFeatureCacher(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.device = torch.device(cfg.device)
-        # DINOv3
-        self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name)
-        self.dino = AutoModel.from_pretrained(cfg.dino_model_name)
+        # DINOv3 - 先尝试本地加载
+        print(f"[VisionEncoder] 加载 DINOv3: {cfg.dino_model_name}")
+        is_local_dino = os.path.exists(cfg.dino_model_name) if cfg.dino_model_name else False
+        if is_local_dino:
+            print(f"[VisionEncoder] ✓ DINOv3 路径是本地路径，尝试从本地加载...")
+            try:
+                self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name, local_files_only=True)
+                self.dino = AutoModel.from_pretrained(cfg.dino_model_name, local_files_only=True)
+                print(f"[VisionEncoder] ✓ DINOv3 从本地加载成功")
+            except (OSError, ValueError, AttributeError, Exception) as e:
+                # AttributeError 可能发生在 transformers 内部处理 local_files_only=True 时
+                print(f"[VisionEncoder] ⚠ DINOv3 本地加载失败 ({type(e).__name__}): {e}")
+                print(f"[VisionEncoder] → 从 HuggingFace Hub 下载 DINOv3...")
+                self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name)
+                self.dino = AutoModel.from_pretrained(cfg.dino_model_name)
+                print(f"[VisionEncoder] ✓ DINOv3 从 Hub 下载完成")
+        else:
+            print(f"[VisionEncoder] DINOv3 是 Hub ID，先检查本地缓存...")
+            try:
+                self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name, local_files_only=True)
+                self.dino = AutoModel.from_pretrained(cfg.dino_model_name, local_files_only=True)
+                print(f"[VisionEncoder] ✓ DINOv3 从本地缓存加载成功")
+            except (OSError, ValueError, AttributeError, Exception) as e:
+                # AttributeError 可能发生在 transformers 内部处理 local_files_only=True 时
+                print(f"[VisionEncoder] → DINOv3 本地缓存不存在或加载失败 ({type(e).__name__})，从 HuggingFace Hub 下载...")
+                self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name)
+                self.dino = AutoModel.from_pretrained(cfg.dino_model_name)
+                print(f"[VisionEncoder] ✓ DINOv3 从 Hub 下载完成")
         self.dino.eval().to(self.device)
         self.dino_patch = getattr(self.dino.config, 'patch_size', None)
         # Default to 0 registers when field is missing
         self.dino_regs = int(getattr(self.dino.config, 'num_register_tokens', 0) or 0)
         self.dino_hidden = getattr(self.dino.config, 'hidden_size', 384)
-        # SigLIP (vision)
-        self.siglip_proc = SiglipImageProcessor.from_pretrained(cfg.siglip_model_name)
-        self.siglip = SiglipVisionModel.from_pretrained(cfg.siglip_model_name)
+        # SigLIP (vision) - 先尝试本地缓存
+        print(f"[VisionEncoder] 加载 SigLIP: {cfg.siglip_model_name}")
+        try:
+            self.siglip_proc = SiglipImageProcessor.from_pretrained(cfg.siglip_model_name, local_files_only=True)
+            self.siglip = SiglipVisionModel.from_pretrained(cfg.siglip_model_name, local_files_only=True)
+            print(f"[VisionEncoder] ✓ SigLIP 从本地缓存加载成功")
+        except (OSError, ValueError, AttributeError, Exception) as e:
+            # AttributeError 可能发生在 transformers 内部处理 local_files_only=True 时
+            print(f"[VisionEncoder] → SigLIP 本地缓存不存在或加载失败 ({type(e).__name__})，从 HuggingFace Hub 下载...")
+            self.siglip_proc = SiglipImageProcessor.from_pretrained(cfg.siglip_model_name)
+            self.siglip = SiglipVisionModel.from_pretrained(cfg.siglip_model_name)
+            print(f"[VisionEncoder] ✓ SigLIP 从 Hub 下载完成")
         self.siglip.eval().to(self.device)
         self.siglip_hidden = getattr(self.siglip.config, 'hidden_size', 1152)
 

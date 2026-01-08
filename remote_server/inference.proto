@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+package inference;
+
+// 视频帧推理服务
+service InferenceService {
+    // 单帧推理
+    rpc Infer(InferRequest) returns (InferResponse);
+    
+    // 流式推理（双向流）
+    rpc StreamInfer(stream InferRequest) returns (stream InferResponse);
+    
+    // 健康检查
+    rpc HealthCheck(Empty) returns (HealthResponse);
+}
+
+message Empty {}
+
+message InferRequest {
+    // JPEG编码的图像数据
+    bytes image_data = 1;
+    
+    // 文本指令
+    string instruction = 2;
+    
+    // 帧ID（用于匹配响应）
+    int64 frame_id = 3;
+    
+    // 时间戳（毫秒）
+    int64 timestamp_ms = 4;
+}
+
+message InferResponse {
+    // 帧ID
+    int64 frame_id = 1;
+    
+    // Waypoints: [x, y, theta] * n_waypoints，展平为一维数组
+    repeated float waypoints = 2;
+    
+    // waypoints数量
+    int32 n_waypoints = 3;
+    
+    // 推理耗时（毫秒）
+    float inference_time_ms = 4;
+    
+    // 错误信息（如果有）
+    string error = 5;
+    
+    // 是否成功
+    bool success = 6;
+}
+
+message HealthResponse {
+    bool healthy = 1;
+    string model_status = 2;
+    string device = 3;
+}
+

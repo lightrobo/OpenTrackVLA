@@ -282,7 +282,12 @@ class OpenTrackVLA(nn.Module):
         self.cfg = cfg
         self.llm = AutoModel.from_pretrained(cfg.llm_name, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None)
         self.llm.requires_grad_(not cfg.freeze_llm)
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
+        # 优先使用本地缓存的tokenizer，避免429错误
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name, local_files_only=True)
+        except (OSError, ValueError):
+            # 如果本地不存在，再尝试从Hub加载（但这种情况应该很少见）
+            self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
         self.D = self.llm.config.hidden_size
         self.proj = CrossModalityProjector(vision_feat_dim, self.D)
         # Always keep projector trainable regardless of LLM freeze
