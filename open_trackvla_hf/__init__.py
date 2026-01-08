@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 from typing import Optional
 
+# 确保 PyTorch 在 transformers 之前导入
+import torch
+
 from transformers import AutoConfig, AutoModel
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from transformers.models.auto.modeling_auto import MODEL_MAPPING

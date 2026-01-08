@@ -22,3 +22,4 @@ ckpt*/
 sim_data/eval/
 sim_data/stt_train/
 sim_data/stt_train_oracle/
+test_space/

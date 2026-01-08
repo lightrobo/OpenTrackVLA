@@ -1,0 +1,11 @@
+# Minimal requirements for inference only (no habitat-sim needed)
+# For running run_inference_agx.py and similar inference scripts
+
+# PyTorch >= 2.1 required by transformers
+torch>=2.1.0
+transformers>=4.30.0
+opencv-python>=4.5.0
+Pillow>=9.0.0
+numpy>=1.20.0,<1.24.0
+huggingface-hub>=0.16.0
+
