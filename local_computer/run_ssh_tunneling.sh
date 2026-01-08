@@ -3,11 +3,11 @@
 # 在本地电脑上运行，建立到云端开发机的端口转发
 
 # ============ 配置区域 ============
-REMOTE_USER="your_username"          # 云端用户名
-REMOTE_HOST="your_cloud_server.com"  # 云端服务器地址
+REMOTE_USER="root"          # 云端用户名
+REMOTE_HOST="172.18.16.32"  # 云端服务器地址
 REMOTE_PORT=50051                    # 云端gRPC端口
 LOCAL_PORT=50051                     # 本地暴露端口
-SSH_PORT=22                          # SSH端口
+SSH_PORT=2222                          # SSH端口
 
 # 可选：SSH密钥路径
 # SSH_KEY="~/.ssh/id_rsa"
