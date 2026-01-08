@@ -150,7 +150,7 @@ def serve(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='云端推理服务器')
-    parser.add_argument('--model-dir', type=str, required=True, help='HuggingFace模型目录路径')
+    parser.add_argument('--model-dir', type=str, default=None, help='HuggingFace模型目录路径（可选，也可通过 HF_MODEL_DIR 环境变量设置）')
     parser.add_argument('--port', type=int, default=50051, help='gRPC端口')
     parser.add_argument('--device', type=str, default='cuda', help='计算设备')
     parser.add_argument('--workers', type=int, default=4, help='工作线程数')
