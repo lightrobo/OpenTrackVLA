@@ -12,7 +12,9 @@ HEIGHT=480                      # 图像高度
 FPS=10                          # 目标帧率
 JPEG_QUALITY=80                 # JPEG压缩质量 (1-100)
 INSTRUCTION="Follow the person" # 文本指令
-HEADLESS=true            # 是否无头模式（不显示画面）
+HEADLESS=true                   # 是否无头模式（不显示画面）
+HTTP_STREAM=true                # 是否启用HTTP视频流
+HTTP_PORT=8080                  # HTTP流端口
 # ================================
 
 # 解析命令行参数
@@ -21,6 +23,22 @@ while [[ $# -gt 0 ]]; do
         --no-display)
             HEADLESS=true
             shift
+            ;;
+        --display)
+            HEADLESS=false
+            shift
+            ;;
+        --http-stream)
+            HTTP_STREAM=true
+            shift
+            ;;
+        --no-http-stream)
+            HTTP_STREAM=false
+            shift
+            ;;
+        --http-port)
+            HTTP_PORT="$2"
+            shift 2
             ;;
         --server)
             SERVER_ADDR="$2"
@@ -54,6 +72,10 @@ echo "  帧率:         ${FPS} fps"
 echo "  JPEG质量:     ${JPEG_QUALITY}"
 echo "  指令:         ${INSTRUCTION}"
 echo "  无头模式:     ${HEADLESS}"
+echo "  HTTP视频流:   ${HTTP_STREAM}"
+if [ "${HTTP_STREAM}" = true ]; then
+    echo "  HTTP端口:     ${HTTP_PORT}"
+fi
 echo ""
 
 # 构建命令
@@ -70,10 +92,24 @@ if [ "${HEADLESS}" = true ]; then
     CMD="${CMD} --no-display"
 fi
 
+if [ "${HTTP_STREAM}" = true ]; then
+    CMD="${CMD} --http-stream --http-port ${HTTP_PORT}"
+fi
+
 echo "执行命令:"
 echo "  ${CMD}"
 echo ""
-echo "按 'q' 退出, 'r' 重置历史"
+if [ "${HTTP_STREAM}" = true ]; then
+    # 获取本机IP
+    LOCAL_IP=$(hostname -I | awk '{print $1}')
+    echo "📺 HTTP视频流地址: http://${LOCAL_IP}:${HTTP_PORT}"
+    echo ""
+fi
+if [ "${HEADLESS}" = true ]; then
+    echo "按 Ctrl+C 退出"
+else
+    echo "按 'q' 退出, 'r' 重置历史"
+fi
 echo ""
 
 # 执行
