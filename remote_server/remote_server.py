@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 云端推理服务器 - gRPC Server
-在云端开发机上运行，接收图像进行推理
+直接复用 trained_agent.py 的推理逻辑
 """
 
 import grpc
@@ -15,7 +15,7 @@ from pathlib import Path
 from PIL import Image
 import io
 
-# 添加项目根目录（云端需要有 OpenTrackVLA 项目代码）
+# 添加项目根目录
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent
 sys.path.insert(0, str(project_root))
@@ -24,119 +24,32 @@ sys.path.insert(0, str(project_root))
 import inference_pb2
 import inference_pb2_grpc
 
-import torch
-
-# 延迟导入模型（等torch加载完成）
-OpenTrackVLAForWaypoint = None
-VisionFeatureCacher = None
-VisionCacheConfig = None
-grid_pool_tokens = None
-
-
-class InferenceModel:
-    """推理模型封装"""
-    
-    def __init__(self, model_dir: str, device: str = "cuda", history: int = 31):
-        global OpenTrackVLAForWaypoint, VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens
-        
-        from open_trackvla_hf import OpenTrackVLAForWaypoint
-        from cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens
-        
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.history = history
-        
-        print(f"[Server] 使用设备: {self.device}")
-        print(f"[Server] 加载模型: {model_dir}")
-        
-        # 加载模型
-        self.model = OpenTrackVLAForWaypoint.from_pretrained(
-            model_dir,
-            torch_dtype=torch.float32 if self.device.type == "cpu" else torch.bfloat16
-        ).to(self.device).eval()
-        print("[Server] OpenTrackVLA模型加载完成")
-        
-        # 初始化vision encoder
-        vision_cfg = VisionCacheConfig(
-            image_size=384,
-            batch_size=1,
-            device=str(self.device)
-        )
-        self.vision_encoder = VisionFeatureCacher(vision_cfg)
-        self.vision_encoder.eval()
-        print("[Server] Vision encoder初始化完成")
-        
-        # 历史缓存
-        self.coarse_history = []
-    
-    def encode_frame(self, rgb_frame: np.ndarray):
-        """编码单帧"""
-        pil_img = Image.fromarray(rgb_frame.astype(np.uint8))
-        
-        tok_dino, Hp, Wp = self.vision_encoder._encode_dino([pil_img])
-        tok_sigl = self.vision_encoder._encode_siglip([pil_img], out_hw=(Hp, Wp))
-        
-        Vt_cat = torch.cat([tok_dino, tok_sigl], dim=-1)
-        Vfine = grid_pool_tokens(Vt_cat, Hp, Wp, out_tokens=64)[0].float()
-        Vcoarse = grid_pool_tokens(Vt_cat, Hp, Wp, out_tokens=4)[0].float()
-        
-        return Vcoarse, Vfine
-    
-    def predict(self, rgb_frame: np.ndarray, instruction: str) -> np.ndarray:
-        """预测waypoints"""
-        Vcoarse_curr, Vfine_curr = self.encode_frame(rgb_frame)
-        
-        # 更新历史
-        self.coarse_history.append(Vcoarse_curr.cpu())
-        
-        # 构建历史序列
-        H = self.history
-        hist = list(self.coarse_history)
-        if len(hist) < H:
-            pad_needed = H - len(hist)
-            first = hist[0] if hist else Vcoarse_curr.cpu()
-            hist = [first] * pad_needed + hist
-        else:
-            hist = hist[-H:]
-        
-        # 构建tokens
-        coarse_list = []
-        coarse_tidx = []
-        for t, tok4 in enumerate(hist):
-            tok4 = tok4.to(self.device)
-            coarse_list.append(tok4)
-            coarse_tidx.append(
-                torch.full((tok4.size(0),), fill_value=t, dtype=torch.long, device=self.device)
-            )
-        
-        coarse_tokens = torch.cat(coarse_list, dim=0).unsqueeze(0)
-        coarse_tidx = torch.cat(coarse_tidx, dim=0).unsqueeze(0)
-        
-        fine_tokens = Vfine_curr.to(self.device).unsqueeze(0)
-        fine_tidx = torch.full((1, fine_tokens.size(1)), fill_value=H, dtype=torch.long, device=self.device)
-        
-        # 推理
-        with torch.inference_mode():
-            waypoints = self.model(
-                coarse_tokens, coarse_tidx,
-                fine_tokens, fine_tidx,
-                [instruction]
-            )
-        
-        return waypoints[0].detach().cpu().float().numpy()
-    
-    def reset_history(self):
-        """重置历史"""
-        self.coarse_history = []
+# 直接导入 trained_agent 的推理类
+from trained_agent import GTBBoxAgent
 
 
 class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
-    """gRPC 服务实现"""
+    """gRPC 服务实现 - 直接复用 GTBBoxAgent"""
     
-    def __init__(self, model: InferenceModel):
-        self.model = model
+    def __init__(self, model_dir: str, device: str = "cuda"):
+        # 设置环境变量，让 GTBBoxAgent 加载正确的模型
+        if model_dir:
+            os.environ['HF_MODEL_DIR'] = model_dir
+        
+        # 创建一个临时目录用于 GTBBoxAgent（它需要 result_path）
+        tmp_dir = "/tmp/grpc_inference"
+        os.makedirs(tmp_dir, exist_ok=True)
+        
+        # 实例化 GTBBoxAgent，复用其完整的推理逻辑
+        self.agent = GTBBoxAgent(result_path=tmp_dir)
+        self.device = device
+        
+        print(f"[Server] GTBBoxAgent 初始化完成")
+        print(f"[Server] 模型目录: {model_dir}")
+        print(f"[Server] 设备: {self.agent.planner_device}")
     
     def Infer(self, request, context):
-        """单帧推理"""
+        """单帧推理 - 直接调用 GTBBoxAgent._planner_action"""
         start_time = time.time()
         
         try:
@@ -144,19 +57,39 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
             image = Image.open(io.BytesIO(request.image_data))
             rgb_frame = np.array(image.convert('RGB'))
             
-            # 推理
-            waypoints = self.model.predict(rgb_frame, request.instruction)
+            # 直接调用 GTBBoxAgent 的推理方法
+            instruction = request.instruction or "follow the person"
+            action = self.agent._planner_action(rgb_frame, instruction)
             
             inference_time = (time.time() - start_time) * 1000
             
+            if action is None:
+                return inference_pb2.InferResponse(
+                    frame_id=request.frame_id,
+                    error="Planner returned None",
+                    success=False
+                )
+            
+            # 获取预测的轨迹（如果有）
+            traj = self.agent._last_predicted_traj
+            if traj is not None:
+                waypoints = traj.flatten().tolist()
+                n_waypoints = traj.shape[0]
+            else:
+                # 如果没有轨迹，返回 action 作为单个 waypoint
+                waypoints = action
+                n_waypoints = 1
+            
             return inference_pb2.InferResponse(
                 frame_id=request.frame_id,
-                waypoints=waypoints.flatten().tolist(),
-                n_waypoints=waypoints.shape[0],
+                waypoints=waypoints,
+                n_waypoints=n_waypoints,
                 inference_time_ms=inference_time,
                 success=True
             )
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             return inference_pb2.InferResponse(
                 frame_id=request.frame_id,
                 error=str(e),
@@ -170,20 +103,26 @@ class InferenceServicer(inference_pb2_grpc.InferenceServiceServicer):
     
     def HealthCheck(self, request, context):
         """健康检查"""
+        model_loaded = self.agent.planner_model is not None
         return inference_pb2.HealthResponse(
-            healthy=True,
-            model_status="loaded",
-            device=str(self.model.device)
+            healthy=model_loaded,
+            model_status="loaded" if model_loaded else "not_loaded",
+            device=str(self.agent.planner_device)
         )
+    
+    def reset(self):
+        """重置历史状态"""
+        self.agent._coarse_hist_tokens.clear()
+        self.agent._last_predicted_traj = None
 
 
 def serve(args):
     """启动服务"""
-    print(f"[Server] 初始化模型...")
-    model = InferenceModel(
+    print(f"[Server] 初始化推理服务...")
+    
+    servicer = InferenceServicer(
         model_dir=args.model_dir,
-        device=args.device,
-        history=args.history
+        device=args.device
     )
     
     server = grpc.server(
@@ -194,9 +133,7 @@ def serve(args):
         ]
     )
     
-    inference_pb2_grpc.add_InferenceServiceServicer_to_server(
-        InferenceServicer(model), server
-    )
+    inference_pb2_grpc.add_InferenceServiceServicer_to_server(servicer, server)
     
     server.add_insecure_port(f'[::]:{args.port}')
     server.start()
@@ -213,12 +150,10 @@ def serve(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='云端推理服务器')
-    parser.add_argument('--model-dir', type=str, required=True, help='模型目录路径')
+    parser.add_argument('--model-dir', type=str, required=True, help='HuggingFace模型目录路径')
     parser.add_argument('--port', type=int, default=50051, help='gRPC端口')
     parser.add_argument('--device', type=str, default='cuda', help='计算设备')
-    parser.add_argument('--history', type=int, default=31, help='历史帧数量')
     parser.add_argument('--workers', type=int, default=4, help='工作线程数')
     
     args = parser.parse_args()
     serve(args)
-

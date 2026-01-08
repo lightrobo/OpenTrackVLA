@@ -59,19 +59,45 @@ AGX Orin (192.168.1.50)
 
 ## 测试命令
 
+### 测试 本地电脑 → 云端（在本地电脑上执行）
+
+验证 SSH 隧道是否正常工作：
+
 ```bash
 # 健康检查
 python local_client.py --server localhost:50051
 
-# 测试单张图片
-python local_client.py --image test.jpg
+# 延迟测试（10次往返）
+python local_client.py --server localhost:50051 --latency-test
+
+# 测试单张图片推理
+python local_client.py --server localhost:50051 --image test.jpg
+
+# 测试视频推理
+python local_client.py --server localhost:50051 --video test.mp4 --max-frames 50
+```
+
+### 测试 AGX → 本地电脑 → 云端（在 AGX 上执行）
+
+验证完整链路是否正常：
+
+```bash
+# 健康检查（192.168.1.100 替换为你本地电脑的IP）
+python local_client.py --server 192.168.1.100:50051
 
 # 延迟测试
-python local_client.py --latency-test
-
-# 测试视频
-python local_client.py --video test.mp4 --max-frames 50
+python local_client.py --server 192.168.1.100:50051 --latency-test
 ```
+
+### 参数说明
+
+| 参数 | 作用 |
+|-----|-----|
+| `--server` | gRPC 服务器地址（默认 localhost:50051） |
+| `--image` | 测试单张图片推理 |
+| `--video` | 测试视频流推理 |
+| `--latency-test` | 运行 10 次往返延迟测试 |
+| `--max-frames` | 视频测试最大帧数（默认 100） |
 
 ## 确保 AGX 能连接到本地电脑
 
