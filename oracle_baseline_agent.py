@@ -154,6 +154,7 @@ class OracleBaselineAgent(AgentConfig):
     # 距离阈值 (米)
     DANGER_DISTANCE = 0.8
     MIN_DISTANCE = 1.2
+    FOLLOW_DISTANCE = 2.0  # 理想跟踪距离
     
     # PD 增益 (和 Baseline 完全一样)
     KP_T = 2      # 转向
@@ -268,36 +269,31 @@ class OracleBaselineAgent(AgentConfig):
         rgb_ = rgb[:, :, :3]
         self.rgb_list.append(rgb_)
         
-        action = [0.0, 0.0, 0.0]
-        action = self._search_action()
+        # 获取 navmesh waypoint 导航动作
+        action = self.to_navmesh_waypoint()
         move_speed, y_speed, yaw_speed = action
+        
+        # 距离控制 - 保持与目标的安全距离
+        gt_dist = self._get_gt_distance()
+        
+        if gt_dist < self.DANGER_DISTANCE:
+            # 太近了，后退
+            move_speed = -0.8
+        elif gt_dist < self.MIN_DISTANCE:
+            # 接近危险区，停止或微退
+            ratio = (self.MIN_DISTANCE - gt_dist) / (self.MIN_DISTANCE - self.DANGER_DISTANCE)
+            move_speed = -0.1 * ratio
+        elif gt_dist < self.FOLLOW_DISTANCE:
+            # 在跟踪区间内，减速（距离越近速度越慢）
+            ratio = (gt_dist - self.MIN_DISTANCE) / (self.FOLLOW_DISTANCE - self.MIN_DISTANCE)
+            move_speed = move_speed * ratio
+        # else: 距离 > FOLLOW_DISTANCE，保持原速度追踪
         
         # 渲染2D可视化帧（在获取waypoint之后）
         self._render_2d_frame()
         
         return [move_speed, y_speed, yaw_speed]
 
-    def _pd_control(self, center_x, bbox_area):
-        """
-        PD 控制 - 和 Baseline 完全一样！
-        
-        error_t = 0.5 - center_x
-        - 目标在左边 (center_x < 0.5) → error_t > 0 → yaw > 0 → 左转
-        - 目标在右边 (center_x > 0.5) → error_t < 0 → yaw < 0 → 右转
-        """
-        error_t = 0.5 - center_x
-        error_f = (self.TARGET_AREA - bbox_area) / 10000
-        if abs(error_f) < 0.5:
-            error_f = 0
-        
-        yaw_speed = self.KP_T * error_t
-        move_speed = self.KP_F * error_f
-        y_speed = self.KP_Y * error_t
-        
-        self.prev_error_t = error_t
-        self.prev_error_f = error_f
-        
-        return [move_speed, y_speed, yaw_speed]
 
     def _get_navmesh_waypoint(self, target_pos):
         """
@@ -323,7 +319,7 @@ class OracleBaselineAgent(AgentConfig):
             return np.array(path.points[1])  # 返回下一个 waypoint
         return None
 
-    def _search_action(self):
+    def to_navmesh_waypoint(self):
         """
         搜索 - 用 GT 位置 + Navmesh 判断往哪走
         
@@ -371,7 +367,7 @@ class OracleBaselineAgent(AgentConfig):
         yaw_speed = -angle_diff * 2.0
         yaw_speed = np.clip(yaw_speed, -1.0, 1.0)
 
-        move_speed = 0.3
+        move_speed = 0.8
 
         return [move_speed, 0.0, yaw_speed]
 

@@ -5,7 +5,7 @@
 
 CHUNKS=30
 NUM_PARALLEL=2
-SEED=101
+SEED=102
 SAVE_PATH="sim_data/stt_train_oracle/seed_${SEED}"
 IDX=0
 
