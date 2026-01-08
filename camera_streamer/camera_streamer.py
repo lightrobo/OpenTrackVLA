@@ -3,6 +3,11 @@
 AGX Orin 摄像头采集端 - gRPC Client
 采集USB摄像头画面，通过gRPC发送到云端推理
 支持 HTTP 视频流用于远程查看
+
+服务器返回的是 waypoints（累积位移），不是速度！
+- x: 前进方向位移 (m)，相对起点
+- y: 左右方向位移 (m)，相对起点
+- theta: 朝向角 (rad)，相对起点
 """
 
 import cv2
@@ -12,7 +17,7 @@ import argparse
 import numpy as np
 from typing import Optional, Tuple
 from threading import Thread, Lock
-import io
+import math
 
 # 导入生成的 gRPC 代码
 import inference_pb2
@@ -99,8 +104,8 @@ class CameraStreamer:
         _, buffer = cv2.imencode('.jpg', rgb, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         return buffer.tobytes()
     
-    def infer(self, frame: np.ndarray, instruction: str) -> Optional[np.ndarray]:
-        """发送帧到云端推理"""
+    def infer(self, frame: np.ndarray, instruction: str) -> Tuple[Optional[np.ndarray], float]:
+        """发送帧到云端推理，返回 waypoints（累积位移序列）"""
         self.frame_id += 1
         
         # 编码
@@ -118,6 +123,7 @@ class CameraStreamer:
             response = self.stub.Infer(request)
             
             if response.success:
+                # 服务器返回的是累积位移: [x, y, theta] * n_waypoints
                 waypoints = np.array(response.waypoints).reshape(response.n_waypoints, 3)
                 return waypoints, response.inference_time_ms
             else:
@@ -127,53 +133,84 @@ class CameraStreamer:
             print(f"[Client] gRPC错误: {e}")
             return None, 0
     
-    def draw_waypoints(self, frame: np.ndarray, waypoints: np.ndarray, scale: float = 120.0) -> np.ndarray:
-        """在画面上绘制waypoints，包括位置和朝向"""
-        import math
+    def draw_trajectory(self, frame: np.ndarray, waypoints: np.ndarray, scale: float = 120.0) -> np.ndarray:
+        """
+        在画面上绘制轨迹
         
+        参数:
+            frame: 原始图像
+            waypoints: 累积位移序列 (N, 3) - [x, y, theta]
+                       x: 前进方向位移 (m)
+                       y: 左侧方向位移 (m)
+                       theta: 朝向角 (rad)
+            scale: 像素/米 的缩放比例 (默认120，与项目其他地方一致)
+        """
         vis = frame.copy()
         h, w = vis.shape[:2]
-        cx, cy = w // 2, h - 50  # 底部中心作为原点
+        # 与项目其他地方一致的投影参数
+        cx = w // 2              # 图像宽度中心
+        cy = int(h * 0.86)       # 图像高度的 86% 处作为机器人位置
         
-        arrow_len = 25  # 方向箭头长度
+        arrow_len = 20  # 方向箭头长度
         
-        points = []
+        # 绘制轨迹点
+        points = [(cx, cy)]  # 起点
         for i, (x, y, theta) in enumerate(waypoints):
-            # 转换坐标：x前进变为向上，y左右保持
-            px = int(cx - y * scale)  # 左右
-            py = int(cy - x * scale)  # 前后
+            # 转换到屏幕坐标
+            # 世界坐标: x=前（向上），y=左（向左）
+            # 屏幕坐标: px向右增加，py向下增加
+            px = int(cx - y * scale)  # y左 → px左
+            py = int(cy - x * scale)  # x前 → py上
             points.append((px, py))
             
             # 画点
-            color = (0, 255, 0) if i == 0 else (0, 255 - min(i * 20, 255), min(i * 20, 255))
-            cv2.circle(vis, (px, py), 6, color, -1)
-            cv2.circle(vis, (px, py), 8, (255, 255, 255), 1)
+            # 颜色渐变：绿色（近）→ 红色（远）
+            progress = i / max(len(waypoints) - 1, 1)
+            color = (
+                int(255 * progress),      # R: 远处变红
+                int(255 * (1 - progress)), # G: 近处绿
+                0
+            )
+            cv2.circle(vis, (px, py), 5, color, -1)
+            cv2.circle(vis, (px, py), 7, (255, 255, 255), 1)
             
-            # 画方向箭头（theta）
-            # theta=0 表示向前（向上），theta>0 表示左转，theta<0 表示右转
-            # 屏幕坐标：向上是 -y，需要转换
-            arrow_dx = int(-arrow_len * math.sin(theta))  # 左右分量
-            arrow_dy = int(-arrow_len * math.cos(theta))  # 前后分量（向上为负）
+            # 画方向箭头（显示 theta）
+            arrow_dx = int(-arrow_len * math.sin(theta))
+            arrow_dy = int(-arrow_len * math.cos(theta))
             arrow_end = (px + arrow_dx, py + arrow_dy)
             
-            # 箭头颜色：绿色=直行，黄色=小转弯，红色=大转弯
+            # 箭头颜色：根据转向角度
             turn_intensity = min(abs(theta) / 0.5, 1.0)  # 0.5 rad ≈ 30° 作为最大
             arrow_color = (
-                int(255 * turn_intensity),  # R: 转弯越大越红
-                int(255 * (1 - turn_intensity)),  # G: 直行越绿
+                int(255 * turn_intensity),
+                int(255 * (1 - turn_intensity * 0.5)),
                 0
             )
             cv2.arrowedLine(vis, (px, py), arrow_end, arrow_color, 2, tipLength=0.4)
         
-        # 连线（轨迹）
+        # 连线（轨迹路径）
         for i in range(len(points) - 1):
-            cv2.line(vis, points[i], points[i + 1], (0, 200, 0), 2)
+            # 渐变线条颜色
+            progress = i / max(len(points) - 2, 1)
+            line_color = (
+                int(100 * progress),
+                int(200 * (1 - progress * 0.5)),
+                0
+            )
+            cv2.line(vis, points[i], points[i + 1], line_color, 2)
         
-        # 画机器人位置（底部中心）
-        cv2.circle(vis, (cx, cy), 10, (255, 0, 0), -1)
-        # 机器人朝向（向上）
-        cv2.arrowedLine(vis, (cx, cy), (cx, cy - 30), (255, 100, 100), 2, tipLength=0.3)
-        cv2.putText(vis, "Robot", (cx - 25, cy + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        # 画机器人位置（底部中心 = 起点）
+        cv2.circle(vis, (cx, cy), 12, (255, 0, 0), -1)
+        cv2.circle(vis, (cx, cy), 14, (255, 255, 255), 2)
+        # 机器人朝向箭头（向上 = 初始朝向）
+        cv2.arrowedLine(vis, (cx, cy), (cx, cy - 35), (255, 100, 100), 3, tipLength=0.3)
+        cv2.putText(vis, "Robot", (cx - 25, cy + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # 显示第一个 waypoint 信息
+        if len(waypoints) > 0:
+            x, y, theta = waypoints[0]
+            wp_info = f"WP0: x={x:.2f}m y={y:.2f}m th={math.degrees(theta):.1f}deg"
+            cv2.putText(vis, wp_info, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
         return vis
     
@@ -238,12 +275,25 @@ class CameraStreamer:
                         margin-top: 10px; 
                         color: #888; 
                     }
+                    .legend {
+                        margin-top: 15px;
+                        padding: 10px;
+                        background: #2a2a4e;
+                        border-radius: 5px;
+                        font-size: 12px;
+                    }
                 </style>
             </head>
             <body>
                 <h1>🤖 OpenTrackVLA Live Stream</h1>
                 <img src="/video_feed" alt="Video Stream">
-                <p class="info">实时推理可视化 | Waypoints 叠加显示</p>
+                <p class="info">实时推理可视化 | 累积位移轨迹</p>
+                <div class="legend">
+                    <b>图例:</b><br>
+                    🔴 机器人位置（起点）| 
+                    🟢→🔴 waypoints（近→远）| 
+                    ➤ 朝向箭头
+                </div>
             </body>
             </html>
             '''
@@ -305,7 +355,7 @@ class CameraStreamer:
                 
                 if result[0] is not None:
                     waypoints, server_time = result
-                    vis = self.draw_waypoints(frame, waypoints)
+                    vis = self.draw_trajectory(frame, waypoints)
                     
                     # 显示信息
                     info = f"RTT: {rtt:.0f}ms | Server: {server_time:.0f}ms | Frame: {self.frame_id}"
@@ -313,7 +363,8 @@ class CameraStreamer:
                     
                     # 终端输出
                     if not display:
-                        print(f"[Client] Frame {self.frame_id}: RTT={rtt:.0f}ms, Server={server_time:.0f}ms, Waypoints={len(waypoints)}")
+                        x, y, theta = waypoints[0] if len(waypoints) > 0 else (0, 0, 0)
+                        print(f"[Client] Frame {self.frame_id}: RTT={rtt:.0f}ms, x={x:.3f}m, y={y:.3f}m, theta={math.degrees(theta):.1f}deg")
                 else:
                     vis = frame
                     cv2.putText(vis, "Inference Failed", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
