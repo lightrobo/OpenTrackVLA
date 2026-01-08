@@ -128,10 +128,14 @@ class CameraStreamer:
             return None, 0
     
     def draw_waypoints(self, frame: np.ndarray, waypoints: np.ndarray, scale: float = 120.0) -> np.ndarray:
-        """在画面上绘制waypoints"""
+        """在画面上绘制waypoints，包括位置和朝向"""
+        import math
+        
         vis = frame.copy()
         h, w = vis.shape[:2]
         cx, cy = w // 2, h - 50  # 底部中心作为原点
+        
+        arrow_len = 25  # 方向箭头长度
         
         points = []
         for i, (x, y, theta) in enumerate(waypoints):
@@ -141,16 +145,34 @@ class CameraStreamer:
             points.append((px, py))
             
             # 画点
-            color = (0, 255, 0) if i == 0 else (0, 255 - i * 20, i * 20)
+            color = (0, 255, 0) if i == 0 else (0, 255 - min(i * 20, 255), min(i * 20, 255))
             cv2.circle(vis, (px, py), 6, color, -1)
             cv2.circle(vis, (px, py), 8, (255, 255, 255), 1)
+            
+            # 画方向箭头（theta）
+            # theta=0 表示向前（向上），theta>0 表示左转，theta<0 表示右转
+            # 屏幕坐标：向上是 -y，需要转换
+            arrow_dx = int(-arrow_len * math.sin(theta))  # 左右分量
+            arrow_dy = int(-arrow_len * math.cos(theta))  # 前后分量（向上为负）
+            arrow_end = (px + arrow_dx, py + arrow_dy)
+            
+            # 箭头颜色：绿色=直行，黄色=小转弯，红色=大转弯
+            turn_intensity = min(abs(theta) / 0.5, 1.0)  # 0.5 rad ≈ 30° 作为最大
+            arrow_color = (
+                int(255 * turn_intensity),  # R: 转弯越大越红
+                int(255 * (1 - turn_intensity)),  # G: 直行越绿
+                0
+            )
+            cv2.arrowedLine(vis, (px, py), arrow_end, arrow_color, 2, tipLength=0.4)
         
-        # 连线
+        # 连线（轨迹）
         for i in range(len(points) - 1):
             cv2.line(vis, points[i], points[i + 1], (0, 200, 0), 2)
         
         # 画机器人位置（底部中心）
         cv2.circle(vis, (cx, cy), 10, (255, 0, 0), -1)
+        # 机器人朝向（向上）
+        cv2.arrowedLine(vis, (cx, cy), (cx, cy - 30), (255, 100, 100), 2, tipLength=0.3)
         cv2.putText(vis, "Robot", (cx - 25, cy + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
         
         return vis
