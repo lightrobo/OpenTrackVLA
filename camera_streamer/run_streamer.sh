@@ -12,8 +12,33 @@ HEIGHT=480                      # 图像高度
 FPS=10                          # 目标帧率
 JPEG_QUALITY=80                 # JPEG压缩质量 (1-100)
 INSTRUCTION="Follow the person" # 文本指令
-HEADLESS=false                  # 是否无头模式（不显示画面）
+HEADLESS=true            # 是否无头模式（不显示画面）
 # ================================
+
+# 解析命令行参数
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --no-display)
+            HEADLESS=true
+            shift
+            ;;
+        --server)
+            SERVER_ADDR="$2"
+            shift 2
+            ;;
+        --camera)
+            CAMERA_IDX="$2"
+            shift 2
+            ;;
+        --instruction)
+            INSTRUCTION="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
