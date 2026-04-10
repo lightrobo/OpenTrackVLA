@@ -15,6 +15,8 @@ import grpc
 import time
 import argparse
 import numpy as np
+import os
+import sys
 from typing import Optional, Tuple
 from threading import Thread, Lock
 import math
@@ -22,6 +24,29 @@ import math
 # 导入生成的 gRPC 代码
 import inference_pb2
 import inference_pb2_grpc
+
+# TrajectoryController (延迟导入，仅 --publish-vel 模式需要)
+_TrajectoryController = None
+
+def _import_trajectory_controller():
+    global _TrajectoryController
+    if _TrajectoryController is not None:
+        return _TrajectoryController
+    script_dir = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        '..', '..', 'lightrobo_sdk_example_wt1_realsense',
+        'src', 'lightrobo_sdk_example', 'script'
+    ))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from track_vla_client import TrajectoryController
+    _TrajectoryController = TrajectoryController
+    return _TrajectoryController
+
+# ROS2 (延迟导入，仅 --ros-topic / --publish-vel 模式需要)
+_rclpy = None
+_Node = None
+_Image = None
 
 
 class CameraStreamer:
@@ -55,6 +80,15 @@ class CameraStreamer:
         self._frame_lock = Lock()
         self._http_server = None
         
+        # ROS2 共享状态
+        self._ros_node = None
+        self._ros_initialized = False
+        
+        # 速度发布相关
+        self._vel_publisher = None
+        self._vel_controller = None
+        self._vel_timer_running = False
+        
     def connect(self) -> bool:
         """连接gRPC服务器"""
         print(f"[Client] 连接服务器: {self.server_addr}")
@@ -77,8 +111,11 @@ class CameraStreamer:
             print(f"[Client] 连接失败: {e}")
             return False
     
-    def open_camera(self) -> bool:
-        """打开摄像头"""
+    def open_camera(self, ros_topic: str = None) -> bool:
+        """打开摄像头（V4L2 或 ROS2 topic）"""
+        if ros_topic:
+            return self._open_ros_topic(ros_topic)
+        
         print(f"[Client] 打开摄像头: {self.camera_idx}")
         
         self.cap = cv2.VideoCapture(self.camera_idx)
@@ -96,6 +133,126 @@ class CameraStreamer:
         
         print(f"[Client] 摄像头参数: {actual_w}x{actual_h} @ {actual_fps}fps")
         return True
+    
+    def _ensure_ros_initialized(self) -> bool:
+        """确保 rclpy 已初始化且 ROS2 node 已创建（幂等）"""
+        global _rclpy, _Node, _Image
+        if self._ros_initialized:
+            return True
+        try:
+            import rclpy
+            from rclpy.node import Node as RosNode
+            from sensor_msgs.msg import Image as RosImage
+            _rclpy = rclpy
+            _Node = RosNode
+            _Image = RosImage
+        except ImportError:
+            print("[Client] 错误: rclpy 未安装")
+            return False
+
+        if not _rclpy.ok():
+            _rclpy.init()
+
+        self._ros_node = _Node('camera_streamer_client')
+        self._ros_spin_thread = Thread(
+            target=lambda: _rclpy.spin(self._ros_node), daemon=True
+        )
+        self._ros_spin_thread.start()
+        self._ros_initialized = True
+        return True
+
+    def _init_vel_publisher(self) -> bool:
+        """初始化 TrajectoryController + /velocity_commands publisher + 50Hz 定时器"""
+        if not self._ensure_ros_initialized():
+            return False
+
+        TC = _import_trajectory_controller()
+        self._vel_controller = TC(
+            max_vx=0.6, max_vy=0.3, max_wz=0.5,
+            max_acc_vx=2.0, max_acc_vy=1.0, max_acc_wz=3.0,
+            kp_forward=3.0, kp_lateral=0.5, kp_steer=1.5, kp_heading=0.8,
+            kd_steer=0.15,
+            lookahead_steps=2, vy_deadzone=0.08, wp_dt=0.1,
+        )
+
+        from std_msgs.msg import Float32MultiArray
+        self._Float32MultiArray = Float32MultiArray
+        self._vel_publisher = self._ros_node.create_publisher(
+            Float32MultiArray, '/velocity_commands', 10
+        )
+
+        self._vel_timer_running = True
+        self._vel_timer_thread = Thread(target=self._vel_publish_loop, daemon=True)
+        self._vel_timer_thread.start()
+
+        print("[Client] 速度发布已启用: /velocity_commands @ 50Hz")
+        return True
+
+    def _vel_publish_loop(self):
+        """50Hz 循环: compute_velocity → publish"""
+        interval = 1.0 / 50.0
+        while self._vel_timer_running:
+            vx, vy, wz = self._vel_controller.compute_velocity()
+            msg = self._Float32MultiArray()
+            msg.data = [vx, vy, wz]
+            self._vel_publisher.publish(msg)
+            time.sleep(interval)
+
+    def _open_ros_topic(self, topic: str) -> bool:
+        """通过 ROS2 topic 获取图像"""
+        if not self._ensure_ros_initialized():
+            return False
+
+        print(f"[Client] 订阅 ROS2 topic: {topic}")
+        self._ros_frame = None
+        self._ros_frame_lock = Lock()
+        self._ros_topic = topic
+        
+        def _img_callback(msg):
+            h, w = msg.height, msg.width
+            encoding = msg.encoding
+            if encoding in ('rgb8', 'RGB8'):
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            elif encoding in ('bgr8', 'BGR8'):
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 3)
+            elif encoding in ('bgra8', 'BGRA8'):
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 4)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            elif encoding in ('rgba8', 'RGBA8'):
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, 4)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            else:
+                frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, -1)
+            
+            if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                frame = cv2.resize(frame, (self.width, self.height))
+            
+            with self._ros_frame_lock:
+                self._ros_frame = frame
+        
+        self._ros_sub = self._ros_node.create_subscription(
+            _Image, topic, _img_callback, 10
+        )
+
+        # 等待第一帧
+        for _ in range(50):
+            time.sleep(0.1)
+            with self._ros_frame_lock:
+                if self._ros_frame is not None:
+                    h, w = self._ros_frame.shape[:2]
+                    print(f"[Client] ROS2 topic 就绪: {w}x{h}")
+                    return True
+        
+        print(f"[Client] 等待 ROS2 topic 超时: {topic}")
+        return False
+    
+    def _read_ros_frame(self):
+        """从 ROS2 topic 读取最新帧"""
+        with self._ros_frame_lock:
+            if self._ros_frame is not None:
+                return True, self._ros_frame.copy()
+            return False, None
     
     def encode_frame(self, frame: np.ndarray) -> bytes:
         """JPEG编码"""
@@ -312,14 +469,23 @@ class CameraStreamer:
         print(f"[Client] HTTP 视频流启动: http://0.0.0.0:{self.http_port}")
         app.run(host='0.0.0.0', port=self.http_port, threaded=True)
     
-    def run(self, instruction: str = "Follow the person", display: bool = True, http_stream: bool = False):
+    def run(self, instruction: str = "Follow the person", display: bool = True,
+            http_stream: bool = False, ros_topic: str = None, publish_vel: bool = False):
         """主循环"""
         if not self.connect():
             return
         
-        if not self.open_camera():
+        if not self.open_camera(ros_topic=ros_topic):
             return
         
+        self._use_ros = ros_topic is not None
+
+        # 初始化速度发布
+        if publish_vel:
+            if not self._init_vel_publisher():
+                print("[Client] 速度发布初始化失败，退出")
+                return
+
         # 启动 HTTP 流服务器
         if http_stream:
             http_thread = Thread(target=self._start_http_server, daemon=True)
@@ -337,9 +503,11 @@ class CameraStreamer:
         
         try:
             while True:
-                ret, frame = self.cap.read()
+                if self._use_ros:
+                    ret, frame = self._read_ros_frame()
+                else:
+                    ret, frame = self.cap.read()
                 if not ret:
-                    print("[Client] 读取帧失败")
                     continue
                 
                 # 控制帧率
@@ -356,15 +524,24 @@ class CameraStreamer:
                 if result[0] is not None:
                     waypoints, server_time = result
                     vis = self.draw_trajectory(frame, waypoints)
+
+                    # 更新轨迹控制器
+                    if self._vel_controller is not None:
+                        self._vel_controller.update_waypoints(waypoints.tolist())
+                        vx, vy, wz = self._vel_controller.compute_velocity()
+                    else:
+                        vx = vy = wz = 0.0
                     
                     # 显示信息
-                    info = f"RTT: {rtt:.0f}ms | Server: {server_time:.0f}ms | Frame: {self.frame_id}"
-                    cv2.putText(vis, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    vel_str = f"  vel=({vx:+.2f},{vy:+.2f},{wz:+.2f})" if publish_vel else ""
+                    info = f"RTT: {rtt:.0f}ms | Server: {server_time:.0f}ms | Frame: {self.frame_id}{vel_str}"
+                    cv2.putText(vis, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     
                     # 终端输出
                     if not display:
                         x, y, theta = waypoints[0] if len(waypoints) > 0 else (0, 0, 0)
-                        print(f"[Client] Frame {self.frame_id}: RTT={rtt:.0f}ms, x={x:.3f}m, y={y:.3f}m, theta={math.degrees(theta):.1f}deg")
+                        vel_log = f" vel=({vx:+.3f},{vy:+.3f},{wz:+.3f})" if publish_vel else ""
+                        print(f"[Client] Frame {self.frame_id}: RTT={rtt:.0f}ms, x={x:.3f}m, y={y:.3f}m, theta={math.degrees(theta):.1f}deg{vel_log}")
                 else:
                     vis = frame
                     cv2.putText(vis, "Inference Failed", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
@@ -389,11 +566,20 @@ class CameraStreamer:
     
     def close(self, display: bool = True):
         """清理资源"""
+        self._vel_timer_running = False
+        if self._vel_controller:
+            self._vel_controller.stop()
         if self.cap:
             self.cap.release()
+        if self._ros_node:
+            self._ros_node.destroy_node()
+        if _rclpy and _rclpy.ok():
+            try:
+                _rclpy.shutdown()
+            except Exception:
+                pass
         if self.channel:
             self.channel.close()
-        # 只有在显示模式下才调用 destroyAllWindows
         if display:
             cv2.destroyAllWindows()
         print("[Client] 已关闭")
@@ -411,6 +597,12 @@ if __name__ == '__main__':
     parser.add_argument('--no-display', action='store_true', help='不显示画面（headless模式）')
     parser.add_argument('--http-stream', action='store_true', help='启用HTTP视频流（用于远程查看）')
     parser.add_argument('--http-port', type=int, default=8080, help='HTTP流端口')
+    parser.add_argument('--ros-topic', type=str, default=None,
+                        help='通过 ROS2 topic 获取图像（替代 V4L2），例如 /camera/realsense2_camera/color/image_raw')
+    parser.add_argument('--publish-vel', action='store_true', default=True,
+                        help='将推理 waypoints 转化为速度指令，发布到 /velocity_commands（默认开启）')
+    parser.add_argument('--no-publish-vel', action='store_false', dest='publish_vel',
+                        help='禁用速度指令发布')
     
     args = parser.parse_args()
     
@@ -427,5 +619,7 @@ if __name__ == '__main__':
     streamer.run(
         instruction=args.instruction, 
         display=not args.no_display,
-        http_stream=args.http_stream
+        http_stream=args.http_stream,
+        ros_topic=args.ros_topic,
+        publish_vel=args.publish_vel
     )

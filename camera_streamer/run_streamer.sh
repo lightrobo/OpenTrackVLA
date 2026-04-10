@@ -5,8 +5,8 @@
 # ============ 配置区域 ============
 # AGX Orin 连接到本地电脑（中转站），本地电脑通过SSH隧道转发到云端
 # 架构: AGX Orin → 本地电脑:50051 → SSH隧道 → 云端:50051
-SERVER_ADDR="10.8.200.42:50051"   # 本地电脑的局域网IP（需要修改为实际IP）
-CAMERA_IDX=0                    # 摄像头索引
+SERVER_ADDR="10.8.204.67:50051"   # 本地电脑的局域网IP（需要修改为实际IP）
+CAMERA_IDX=0                    # 摄像头索引（仅 V4L2 模式）
 WIDTH=640                       # 图像宽度
 HEIGHT=480                      # 图像高度
 FPS=10                          # 目标帧率
@@ -15,6 +15,8 @@ INSTRUCTION="Follow the person" # 文本指令
 HEADLESS=true                   # 是否无头模式（不显示画面）
 HTTP_STREAM=true                # 是否启用HTTP视频流
 HTTP_PORT=8080                  # HTTP流端口
+ROS_TOPIC="/camera/realsense2_camera/color/image_raw"  # ROS2 图像 topic（留空则走 V4L2）
+PUBLISH_VEL=true                # 是否将 waypoints 转为速度指令发布到 /velocity_commands
 # ================================
 
 # 解析命令行参数
@@ -48,6 +50,22 @@ while [[ $# -gt 0 ]]; do
             CAMERA_IDX="$2"
             shift 2
             ;;
+        --ros-topic)
+            ROS_TOPIC="$2"
+            shift 2
+            ;;
+        --no-ros)
+            ROS_TOPIC=""
+            shift
+            ;;
+        --publish-vel)
+            PUBLISH_VEL=true
+            shift
+            ;;
+        --no-publish-vel)
+            PUBLISH_VEL=false
+            shift
+            ;;
         --instruction)
             INSTRUCTION="$2"
             shift 2
@@ -76,6 +94,12 @@ echo "  HTTP视频流:   ${HTTP_STREAM}"
 if [ "${HTTP_STREAM}" = true ]; then
     echo "  HTTP端口:     ${HTTP_PORT}"
 fi
+if [ -n "${ROS_TOPIC}" ]; then
+    echo "  ROS2 Topic:   ${ROS_TOPIC}"
+else
+    echo "  图像源:       V4L2 (camera ${CAMERA_IDX})"
+fi
+echo "  发布速度:     ${PUBLISH_VEL}"
 echo ""
 
 # 构建命令
@@ -94,6 +118,14 @@ fi
 
 if [ "${HTTP_STREAM}" = true ]; then
     CMD="${CMD} --http-stream --http-port ${HTTP_PORT}"
+fi
+
+if [ -n "${ROS_TOPIC}" ]; then
+    CMD="${CMD} --ros-topic ${ROS_TOPIC}"
+fi
+
+if [ "${PUBLISH_VEL}" = true ]; then
+    CMD="${CMD} --publish-vel"
 fi
 
 echo "执行命令:"
