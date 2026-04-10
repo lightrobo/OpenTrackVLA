@@ -172,7 +172,7 @@ class CameraStreamer:
             max_acc_vx=2.0, max_acc_vy=1.0, max_acc_wz=3.0,
             kp_forward=3.0, kp_lateral=0.5, kp_steer=1.5, kp_heading=0.8,
             kd_steer=0.15,
-            lookahead_steps=2, vy_deadzone=0.08, wp_dt=0.1,
+            lookahead_steps=2, vy_deadzone=0.08, wp_dt=0.3,
         )
 
         from std_msgs.msg import Float32MultiArray
@@ -187,6 +187,12 @@ class CameraStreamer:
 
         print("[Client] 速度发布已启用: /velocity_commands @ 50Hz")
         return True
+
+    def _update_waypoints(self, waypoints):
+        """线程安全地更新 waypoints 并记录时间"""
+        self._vel_controller.update_waypoints(waypoints)
+        self._wp_last_update = time.monotonic()
+        self._wp_stopped = False
 
     def _vel_publish_loop(self):
         """50Hz 循环: compute_velocity → publish"""
@@ -255,10 +261,8 @@ class CameraStreamer:
             return False, None
     
     def encode_frame(self, frame: np.ndarray) -> bytes:
-        """JPEG编码"""
-        # BGR -> RGB
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        _, buffer = cv2.imencode('.jpg', rgb, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        """JPEG编码 (输入 BGR，cv2.imencode 内部处理 BGR→YCbCr)"""
+        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
         return buffer.tobytes()
     
     def infer(self, frame: np.ndarray, instruction: str) -> Tuple[Optional[np.ndarray], float]:
@@ -282,6 +286,10 @@ class CameraStreamer:
             if response.success:
                 # 服务器返回的是累积位移: [x, y, theta] * n_waypoints
                 waypoints = np.array(response.waypoints).reshape(response.n_waypoints, 3)
+                # 模型原生坐标: x=forward, y=right, yaw=CW
+                # 控制器坐标:   x=forward, y=left,  yaw=CCW
+                waypoints[:, 1] *= -1
+                waypoints[:, 2] *= -1
                 return waypoints, response.inference_time_ms
             else:
                 print(f"[Client] 推理错误: {response.error}")
@@ -471,36 +479,46 @@ class CameraStreamer:
     
     def run(self, instruction: str = "Follow the person", display: bool = True,
             http_stream: bool = False, ros_topic: str = None, publish_vel: bool = False):
-        """主循环"""
+        """主循环：帧采集+可视化在主线程，gRPC推理在后台线程"""
         if not self.connect():
             return
-        
+
         if not self.open_camera(ros_topic=ros_topic):
             return
-        
+
         self._use_ros = ros_topic is not None
 
-        # 初始化速度发布
         if publish_vel:
             if not self._init_vel_publisher():
                 print("[Client] 速度发布初始化失败，退出")
                 return
 
-        # 启动 HTTP 流服务器
         if http_stream:
             http_thread = Thread(target=self._start_http_server, daemon=True)
             http_thread.start()
-            time.sleep(1)  # 等待服务器启动
-        
+            time.sleep(1)
+
+        # 后台推理共享状态
+        self._latest_waypoints = None
+        self._latest_rtt = 0.0
+        self._latest_server_time = 0.0
+        self._infer_lock = Lock()
+        self._infer_frame = None
+        self._infer_frame_lock = Lock()
+        self._infer_running = True
+
+        infer_thread = Thread(target=self._inference_loop, args=(instruction,), daemon=True)
+        infer_thread.start()
+
         print(f"[Client] 开始推理循环，指令: '{instruction}'")
         if display:
             print("[Client] 按 'q' 退出, 'r' 重置历史")
         else:
             print("[Client] 按 Ctrl+C 退出")
-        
-        frame_interval = 1.0 / self.fps
-        last_time = time.time()
-        
+
+        display_interval = 1.0 / 30.0
+        last_display_time = 0.0
+
         try:
             while True:
                 if self._use_ros:
@@ -508,49 +526,38 @@ class CameraStreamer:
                 else:
                     ret, frame = self.cap.read()
                 if not ret:
+                    time.sleep(0.005)
                     continue
-                
-                # 控制帧率
-                current_time = time.time()
-                if current_time - last_time < frame_interval:
-                    continue
-                last_time = current_time
-                
-                # 推理
-                start = time.time()
-                result = self.infer(frame, instruction)
-                rtt = (time.time() - start) * 1000
-                
-                if result[0] is not None:
-                    waypoints, server_time = result
-                    vis = self.draw_trajectory(frame, waypoints)
 
-                    # 更新轨迹控制器
-                    if self._vel_controller is not None:
-                        self._vel_controller.update_waypoints(waypoints.tolist())
+                with self._infer_frame_lock:
+                    self._infer_frame = frame.copy()
+
+                now = time.time()
+                if now - last_display_time < display_interval:
+                    time.sleep(0.002)
+                    continue
+                last_display_time = now
+
+                with self._infer_lock:
+                    waypoints = self._latest_waypoints
+                    rtt = self._latest_rtt
+                    server_time = self._latest_server_time
+
+                if waypoints is not None:
+                    vis = self.draw_trajectory(frame, waypoints)
+                    if self._vel_controller:
                         vx, vy, wz = self._vel_controller.compute_velocity()
                     else:
                         vx = vy = wz = 0.0
-                    
-                    # 显示信息
                     vel_str = f"  vel=({vx:+.2f},{vy:+.2f},{wz:+.2f})" if publish_vel else ""
-                    info = f"RTT: {rtt:.0f}ms | Server: {server_time:.0f}ms | Frame: {self.frame_id}{vel_str}"
-                    cv2.putText(vis, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    
-                    # 终端输出
-                    if not display:
-                        x, y, theta = waypoints[0] if len(waypoints) > 0 else (0, 0, 0)
-                        vel_log = f" vel=({vx:+.3f},{vy:+.3f},{wz:+.3f})" if publish_vel else ""
-                        print(f"[Client] Frame {self.frame_id}: RTT={rtt:.0f}ms, x={x:.3f}m, y={y:.3f}m, theta={math.degrees(theta):.1f}deg{vel_log}")
+                    info = f"RTT:{rtt:.0f}ms Srv:{server_time:.0f}ms F:{self.frame_id}{vel_str}"
+                    cv2.putText(vis, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
                 else:
                     vis = frame
-                    cv2.putText(vis, "Inference Failed", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                # 更新 HTTP 流
+
                 if http_stream:
                     self._update_http_frame(vis)
-                
-                # 本地显示
+
                 if display:
                     cv2.imshow('OpenTrackVLA Streamer', vis)
                     key = cv2.waitKey(1) & 0xFF
@@ -558,11 +565,44 @@ class CameraStreamer:
                         break
                     elif key == ord('r'):
                         print("[Client] 发送重置请求...")
-                        
+
         except KeyboardInterrupt:
             print("\n[Client] 收到中断信号")
         finally:
+            self._infer_running = False
             self.close(display)
+
+    def _inference_loop(self, instruction: str):
+        """后台线程：持续取最新帧 → gRPC 推理 → 更新 waypoints"""
+        while self._infer_running:
+            with self._infer_frame_lock:
+                frame = self._infer_frame
+
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            start = time.time()
+            result = self.infer(frame, instruction)
+            rtt = (time.time() - start) * 1000
+
+            if result[0] is not None:
+                waypoints, server_time = result
+
+                if self._vel_controller is not None:
+                    self._update_waypoints(waypoints.tolist())
+
+                with self._infer_lock:
+                    self._latest_waypoints = waypoints
+                    self._latest_rtt = rtt
+                    self._latest_server_time = server_time
+
+                x, y, theta = waypoints[0] if len(waypoints) > 0 else (0, 0, 0)
+                if self._vel_controller:
+                    vx, vy, wz = self._vel_controller.compute_velocity()
+                    print(f"[Infer] F{self.frame_id}: RTT={rtt:.0f}ms x={x:.3f} y={y:.3f} th={math.degrees(theta):.1f}d vel=({vx:+.3f},{vy:+.3f},{wz:+.3f})")
+                else:
+                    print(f"[Infer] F{self.frame_id}: RTT={rtt:.0f}ms x={x:.3f} y={y:.3f} th={math.degrees(theta):.1f}d")
     
     def close(self, display: bool = True):
         """清理资源"""
