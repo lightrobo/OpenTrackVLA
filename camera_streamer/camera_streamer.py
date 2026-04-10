@@ -88,6 +88,8 @@ class CameraStreamer:
         self._vel_publisher = None
         self._vel_controller = None
         self._vel_timer_running = False
+        self._wp_last_update = 0.0
+        self._wp_stopped = False
         
     def connect(self) -> bool:
         """连接gRPC服务器"""
@@ -170,9 +172,10 @@ class CameraStreamer:
         self._vel_controller = TC(
             max_vx=0.6, max_vy=0.3, max_wz=0.5,
             max_acc_vx=2.0, max_acc_vy=1.0, max_acc_wz=3.0,
-            kp_forward=3.0, kp_lateral=0.5, kp_steer=1.5, kp_heading=0.8,
-            kd_steer=0.15,
-            lookahead_steps=2, vy_deadzone=0.08, wp_dt=0.3,
+            kp_forward=3.0, kp_lateral=0.5,
+            kp_steer=0.5, kp_heading=0.3,
+            kd_steer=0.05,
+            lookahead_steps=5, vy_deadzone=0.08, wp_dt=0.1,
         )
 
         from std_msgs.msg import Float32MultiArray
@@ -195,9 +198,18 @@ class CameraStreamer:
         self._wp_stopped = False
 
     def _vel_publish_loop(self):
-        """50Hz 循环: compute_velocity → publish"""
+        """50Hz 循环: compute_velocity → publish，含轨迹超时保护"""
         interval = 1.0 / 50.0
+        TRAJECTORY_TIMEOUT = 1.5
         while self._vel_timer_running:
+            now = time.monotonic()
+            if (self._wp_last_update > 0
+                    and not self._wp_stopped
+                    and (now - self._wp_last_update) > TRAJECTORY_TIMEOUT):
+                self._vel_controller.stop()
+                self._wp_stopped = True
+                print("[Vel] 轨迹超时，停车")
+
             vx, vy, wz = self._vel_controller.compute_velocity()
             msg = self._Float32MultiArray()
             msg.data = [vx, vy, wz]
@@ -597,12 +609,22 @@ class CameraStreamer:
                     self._latest_rtt = rtt
                     self._latest_server_time = server_time
 
-                x, y, theta = waypoints[0] if len(waypoints) > 0 else (0, 0, 0)
+                n = len(waypoints)
+                w0 = waypoints[0] if n > 0 else [0, 0, 0]
+                wL = waypoints[-1] if n > 0 else [0, 0, 0]
+                dist = math.sqrt(wL[0]**2 + wL[1]**2)
                 if self._vel_controller:
                     vx, vy, wz = self._vel_controller.compute_velocity()
-                    print(f"[Infer] F{self.frame_id}: RTT={rtt:.0f}ms x={x:.3f} y={y:.3f} th={math.degrees(theta):.1f}d vel=({vx:+.3f},{vy:+.3f},{wz:+.3f})")
+                    print(f"[Infer] F{self.frame_id}: RTT={rtt:.0f}ms wp={n} "
+                          f"p0=({w0[0]:+.4f},{w0[1]:+.4f},{math.degrees(w0[2]):+.1f}°) "
+                          f"pN=({wL[0]:+.4f},{wL[1]:+.4f},{math.degrees(wL[2]):+.1f}°) "
+                          f"D={dist:.4f}m "
+                          f"vel=({vx:+.3f},{vy:+.3f},{wz:+.3f})")
                 else:
-                    print(f"[Infer] F{self.frame_id}: RTT={rtt:.0f}ms x={x:.3f} y={y:.3f} th={math.degrees(theta):.1f}d")
+                    print(f"[Infer] F{self.frame_id}: RTT={rtt:.0f}ms wp={n} "
+                          f"p0=({w0[0]:+.4f},{w0[1]:+.4f},{math.degrees(w0[2]):+.1f}°) "
+                          f"pN=({wL[0]:+.4f},{wL[1]:+.4f},{math.degrees(wL[2]):+.1f}°) "
+                          f"D={dist:.4f}m")
     
     def close(self, display: bool = True):
         """清理资源"""
